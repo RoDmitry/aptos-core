@@ -1223,6 +1223,7 @@ impl Generator {
             | GetGlobal(_, _, _)
             | Uninit
             | Havoc(_)
+            | HavocGlobal(_, _, _)
             | Stop
             | TraceLocal(_)
             | TraceReturn(_)
@@ -2369,6 +2370,10 @@ impl AssignTransformer<'_> {
                 | Operation::Global(..)
                 | Operation::CanModify
                 | Operation::Old
+                | Operation::SaveStateAnchor(..)
+                | Operation::WithStateAnchor(..)
+                | Operation::FoldsCaptureAnchor(..)
+                | Operation::InlineCallSummary
                 | Operation::Trace(..)
                 | Operation::EmptyVec
                 | Operation::SingleVec

@@ -9,7 +9,7 @@ use aptos_storage_service_types::{
     StorageServiceError,
 };
 use claims::assert_matches;
-use mockall::predicate::eq;
+use mockall::predicate::{always, eq};
 
 #[tokio::test]
 async fn test_get_number_of_states_at_version() {
@@ -22,8 +22,8 @@ async fn test_get_number_of_states_at_version() {
     db_reader
         .expect_get_state_item_count()
         .times(1)
-        .with(eq(version))
-        .returning(move |_| Ok(number_of_states as usize));
+        .with(eq(version), always())
+        .returning(move |_, _| Ok(number_of_states as usize));
 
     // Create the storage client and server
     let (mut mock_client, mut service, _, _, _) = MockClient::new(Some(db_reader), None);
@@ -41,6 +41,70 @@ async fn test_get_number_of_states_at_version() {
         response.get_data_response().unwrap(),
         DataResponse::NumberOfStatesAtVersion(number_of_states)
     );
+}
+
+#[tokio::test]
+async fn test_get_number_of_hot_states_at_version() {
+    let version = 101;
+    let number_of_hot_states = 560;
+
+    let mut db_reader = mock::create_mock_db_reader();
+    db_reader
+        .expect_get_hot_state_item_count()
+        .times(1)
+        .with(eq(version))
+        .returning(move |_| Ok(number_of_hot_states as usize));
+
+    let (mut mock_client, mut service, _, _, _) = MockClient::new(Some(db_reader), None);
+    utils::update_storage_server_summary(&mut service, version, 10);
+    tokio::spawn(service.start());
+
+    let response = utils::get_number_of_hot_states(&mut mock_client, version, false)
+        .await
+        .unwrap();
+
+    assert_matches!(response, StorageServiceResponse::RawResponse(_));
+    assert_eq!(
+        response.get_data_response().unwrap(),
+        DataResponse::NumberOfHotStatesAtVersion(number_of_hot_states)
+    );
+}
+
+#[tokio::test]
+async fn test_get_number_of_hot_states_at_version_not_serviceable() {
+    let version = 101;
+    let (mut mock_client, mut service, _, _, _) = MockClient::new(None, None);
+    utils::update_storage_server_summary(&mut service, version - 1, 10);
+    tokio::spawn(service.start());
+
+    let response = utils::get_number_of_hot_states(&mut mock_client, version, false)
+        .await
+        .unwrap_err();
+    assert_matches!(response, StorageServiceError::InvalidRequest(_));
+}
+
+#[tokio::test]
+async fn test_get_number_of_hot_states_at_version_invalid() {
+    let version = 1;
+    let mut db_reader = mock::create_mock_db_reader();
+    db_reader
+        .expect_get_hot_state_item_count()
+        .times(1)
+        .with(eq(version))
+        .returning(move |_| {
+            Err(AptosDbError::NotFound(
+                format_err!("Version does not exist!").to_string(),
+            ))
+        });
+
+    let (mut mock_client, mut service, _, _, _) = MockClient::new(Some(db_reader), None);
+    utils::update_storage_server_summary(&mut service, version, 10);
+    tokio::spawn(service.start());
+
+    let response = utils::get_number_of_hot_states(&mut mock_client, version, false)
+        .await
+        .unwrap_err();
+    assert_matches!(response, StorageServiceError::InternalError(_));
 }
 
 #[tokio::test]
@@ -72,8 +136,8 @@ async fn test_get_number_of_states_at_version_invalid() {
     db_reader
         .expect_get_state_item_count()
         .times(1)
-        .with(eq(version))
-        .returning(move |_| {
+        .with(eq(version), always())
+        .returning(move |_, _| {
             Err(AptosDbError::NotFound(
                 format_err!("Version does not exist!").to_string(),
             ))

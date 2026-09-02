@@ -1,6 +1,7 @@
 // Copyright (c) Aptos Foundation
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
+pub mod abilities;
 pub mod align;
 mod error;
 mod function;
@@ -23,7 +24,8 @@ pub use align::{
 };
 pub use error::{ExecutionError, ExecutionErrorKind, ExecutionResult, IntoExecutionError};
 pub use function::{
-    Code, FrameLayoutInfo, Function, FunctionPtr, SafePointEntry, SortedSafePointEntries,
+    BytecodeOffset, Code, FrameLayoutInfo, Function, FunctionPtr, SafePointEntry,
+    SortedSafePointEntries,
 };
 pub use gas::{GasExhaustedError, GasMeter};
 pub use instruction::{
@@ -38,27 +40,27 @@ pub use instruction::{
     FUNC_REF_TAG_RESOLVED, FUNC_REF_TAG_UNRESOLVED, OBJECT_HEADER_SIZE, VEC_DATA_OFFSET,
     VEC_LENGTH_OFFSET,
 };
-pub use interner::{view_function_ref, FunctionRef, InternedFunctionRef, Interner, ModuleId};
-pub use move_binary_format::file_format::ConstantPoolIndex;
+pub use interner::{
+    module_id_of, struct_tag_of, type_tag_of, view_function_ref, view_module_id, FunctionRef,
+    InternedFunctionRef, Interner, ModuleId, TypeSubstitutionError,
+};
+pub use move_binary_format::file_format::{ConstantPoolIndex, FunctionDefinitionIndex};
 pub use object_descriptor::{
-    DescriptorProvider, NoDescriptorProvider, ObjectDescriptor, ObjectDescriptorInner,
-    ObjectDescriptorTable, CLOSURE_DESCRIPTOR_ID, NO_DESCRIPTOR_PROVIDER,
-    RESERVED_DESCRIPTOR_COUNT, TRIVIAL_DESCRIPTOR_ID,
+    DescriptorProvider, ObjectDescriptor, ObjectDescriptorInner, ObjectDescriptorTable,
+    CLOSURE_DESCRIPTOR_ID, RESERVED_DESCRIPTOR_COUNT, TRIVIAL_DESCRIPTOR_ID,
 };
 pub use prepared_module::{
-    intern_sig_token, FieldTypes, FunctionInstantiationSignature, FunctionSignature, PreparedModule,
+    intern_sig_token, intern_struct_tag, intern_type_tag, FieldTypes,
+    FunctionInstantiationSignature, FunctionSignature, PreparedModule, PreparedModuleError,
 };
 pub use root_pool::{ObjectHandle, ReferenceHandle, RootPool};
 pub use storage::{
-    ModuleProvider, NoResourceProvider, ResourceProvider, ResourceProviderError, StorageRead,
-    NO_RESOURCE_PROVIDER,
+    nominal_tag, ModuleProvider, NoModuleProvider, NoResourceProvider, ResourceProvider,
+    ResourceProviderError, StorageRead,
 };
-pub use types::{convert_mut_to_immut_ref, strip_ref};
+pub use types::{convert_mut_to_immut_ref, is_assignable, strip_ref};
 pub use value_layout::{
     reserved_layout_id, reserved_layouts, FieldValueLayout, LayoutFlags, LayoutId, LayoutKind,
-    LayoutProvider, NoLayoutProvider, ValueLayout, ValueLayoutTable, NO_LAYOUT_PROVIDER,
+    LayoutProvider, ValueLayout, ValueLayoutTable,
 };
-pub use vm_error::{
-    ArithOp, GlobalStorageOp, LoaderError, LoaderInvariantViolation, LoaderResult, RuntimeError,
-    RuntimeInvariantViolation, RuntimeResult, Signedness, VecOp,
-};
+pub use vm_error::{VMInternalError, VMResult};

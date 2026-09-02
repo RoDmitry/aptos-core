@@ -12,10 +12,8 @@ module aptos_framework::code {
     use std::option::Option;
     use std::string;
     use aptos_framework::event;
+    use aptos_framework::init;
     use aptos_framework::object::{Self, Object};
-    use aptos_framework::permissioned_signer;
-
-    friend aptos_framework::object_code_deployment;
 
     // ----------------------------------------------------------------------
     // Code Publishing
@@ -108,22 +106,15 @@ module aptos_framework::code {
     /// `code_object` does not exist.
     const ECODE_OBJECT_DOES_NOT_EXIST: u64 = 0xA;
 
-    /// Current permissioned signer cannot publish codes.
-    const ENO_CODE_PERMISSION: u64 = 0xB;
+    /// The permissioned signer feature has been removed.
+    const EPERMISSIONED_SIGNER_REMOVED: u64 = 0xC;
 
+    #[deprecated]
     struct CodePublishingPermission has copy, drop, store {}
 
-    /// Permissions
-    public(friend) fun check_code_publishing_permission(s: &signer) {
-        assert!(
-            permissioned_signer::check_permission_exists(s, CodePublishingPermission {}),
-            error::permission_denied(ENO_CODE_PERMISSION),
-        );
-    }
-
-    /// Grant permission to publish code on behalf of the master signer.
-    public fun grant_permission(master: &signer, permissioned_signer: &signer) {
-        permissioned_signer::authorize_unlimited(master, permissioned_signer, CodePublishingPermission {})
+    #[deprecated]
+    public fun grant_permission(_master: &signer, _permissioned_signer: &signer) {
+        abort error::unavailable(EPERMISSIONED_SIGNER_REMOVED)
     }
 
     /// Whether unconditional code upgrade with no compatibility check is allowed. This
@@ -166,7 +157,6 @@ module aptos_framework::code {
     /// Publishes a package at the given signer's address. The caller must provide package metadata describing the
     /// package.
     public fun publish_package(owner: &signer, pack: PackageMetadata, code: vector<vector<u8>>) acquires PackageRegistry {
-        check_code_publishing_permission(owner);
         // Disallow incompatible upgrade mode. Governance can decide later if this should be reconsidered.
         assert!(
             pack.upgrade_policy.policy > upgrade_policy_arbitrary().policy,
@@ -185,6 +175,16 @@ module aptos_framework::code {
         // To avoid prover compiler error on spec
         // the package need to be an immutable variable
         let module_names = get_module_names(&pack);
+
+        // Record, per module in this package, the object's transitive root owner at (re)publish, so
+        // lazy self-init can detect a later transfer of the object or an ancestor since that module
+        // was published (see `init::internal_maybe_initialize`). Objects only; feature-gated.
+        if (features::is_lazy_module_initialization_enabled() && object::is_object(addr)) {
+            let owner = object::address_to_object<object::ObjectCore>(addr).root_owner();
+            module_names.for_each_ref(|name| {
+                init::record_deploy_owner(addr, *name.bytes(), owner);
+            });
+        };
         let package_immutable = &borrow_global<PackageRegistry>(addr).packages;
         let len = package_immutable.length();
         let index = len;
@@ -207,6 +207,10 @@ module aptos_framework::code {
         // Update registry
         let policy = pack.upgrade_policy;
         if (index < len) {
+            pack.modules.for_each_ref(|m| {
+                let m: &ModuleMetadata = m;
+                init::reset_initialized(addr, *m.name.bytes());
+            });
             *packages.borrow_mut(index) = pack
         } else {
             packages.push_back(pack)
@@ -227,7 +231,6 @@ module aptos_framework::code {
     }
 
     public fun freeze_code_object(publisher: &signer, code_object: Object<PackageRegistry>) acquires PackageRegistry {
-        check_code_publishing_permission(publisher);
         let code_object_addr = code_object.object_address();
         assert!(exists<PackageRegistry>(code_object_addr), error::not_found(ECODE_OBJECT_DOES_NOT_EXIST));
         assert!(
@@ -236,18 +239,28 @@ module aptos_framework::code {
         );
 
         let registry = borrow_global_mut<PackageRegistry>(code_object_addr);
-        registry.packages.for_each_mut(|pack| {
-            let package: &mut PackageMetadata = pack;
+        // `for_each_mut` is not used because effectful HOF verification
+        // does not scale yet (TODO(#20391)).
+        let i = 0;
+        let len = registry.packages.length();
+        while (i < len) {
+            let package: &mut PackageMetadata = registry.packages.borrow_mut(i);
             package.upgrade_policy = upgrade_policy_immutable();
-        });
+            i += 1;
+        };
 
         // We unfortunately have to make a copy of each package to avoid borrow checker issues as check_dependencies
         // needs to borrow PackageRegistry from the dependency packages.
         // This would increase the amount of gas used, but this is a rare operation and it's rare to have many packages
         // in a single code object.
-        registry.packages.for_each(|pack| {
-            check_dependencies(code_object_addr, &pack);
-        });
+        let packages = registry.packages;
+        // `for_each` is not used because effectful HOF verification
+        // does not scale yet (TODO(#20391)).
+        let i = 0;
+        while (i < len) {
+            check_dependencies(code_object_addr, packages.borrow(i));
+            i += 1;
+        };
     }
 
     /// Same as `publish_package` but as an entry function which can be called as a transaction. Because
@@ -282,12 +295,7 @@ module aptos_framework::code {
         // The modules introduced by each package must not overlap with `names`.
         old_pack.modules.for_each_ref(|old_mod| {
             let old_mod: &ModuleMetadata = old_mod;
-            let j = 0;
-            while (j < vector::length(new_modules)) {
-                let name = vector::borrow(new_modules, j);
-                assert!(&old_mod.name != name, error::already_exists(EMODULE_NAME_CLASH));
-                j += 1;
-            };
+            assert!(!new_modules.contains(&old_mod.name), error::already_exists(EMODULE_NAME_CLASH));
         });
     }
 
@@ -335,6 +343,9 @@ module aptos_framework::code {
                     } else {
                         false
                     }
+                } spec {
+                    // State the result because the lambda mutates its capture.
+                    ensures result == (dep_pack.name == dep.package_name);
                 });
                 assert!(found, error::not_found(EPACKAGE_DEP_MISSING));
             };

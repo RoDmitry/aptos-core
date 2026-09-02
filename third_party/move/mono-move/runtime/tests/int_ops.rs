@@ -38,11 +38,10 @@ mod common;
 
 use mono_move_alloc::GlobalArenaPtr;
 use mono_move_core::{
-    Code, FrameLayoutInfo, FrameOffset as FO, Function, IntBinaryOp, IntCastOp, IntNegateOp,
-    IntOperand, IntShiftOp, IntTy, MicroOp, ShiftOperand, SortedSafePointEntries,
-    FRAME_METADATA_SIZE,
+    native::NativeExtensions, Code, FrameLayoutInfo, FrameOffset as FO, Function,
+    FunctionDefinitionIndex, IntBinaryOp, IntCastOp, IntNegateOp, IntOperand, IntShiftOp, IntTy,
+    MicroOp, ShiftOperand, SortedSafePointEntries, FRAME_METADATA_SIZE,
 };
-use mono_move_runtime::{InterpreterContext, LocalRuntimeContext};
 use move_core_types::int256::{I256, U256};
 use num_bigint::{BigInt, Sign};
 use proptest::{prelude::*, strategy::BoxedStrategy};
@@ -193,6 +192,7 @@ fn make_func(op: MicroOp) -> Function {
     Function {
         name: GlobalArenaPtr::from_static("op"),
         module_id: crate::program_module_id!("test"),
+        def_idx: FunctionDefinitionIndex(0),
         code: Code::from_vec(vec![op, MicroOp::Return]),
         entry_gas: 0,
         param_slots: vec![],
@@ -215,26 +215,26 @@ fn run_wide(
     dst_size: usize,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let func = make_func(op);
-    let mut exec_ctx = LocalRuntimeContext::with_max_budget_no_descriptors();
-    let mut ctx = InterpreterContext::new(&mut exec_ctx, &func);
-    if !lhs_bytes.is_empty() {
-        ctx.set_root_arg(SLOT_LHS, lhs_bytes);
-    }
-    if !rhs_bytes.is_empty() {
-        ctx.set_root_arg(SLOT_RHS, rhs_bytes);
-    }
-    ctx.run().map_err(|e| anyhow::anyhow!("{}", e))?;
+    common::with_test_interpreter(&func, u64::MAX, NativeExtensions::new(), |ctx| {
+        if !lhs_bytes.is_empty() {
+            ctx.set_root_arg(SLOT_LHS, lhs_bytes);
+        }
+        if !rhs_bytes.is_empty() {
+            ctx.set_root_arg(SLOT_RHS, rhs_bytes);
+        }
+        ctx.run().map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let mut out = vec![0u8; dst_size];
-    let mut i = 0usize;
-    while i < dst_size {
-        let word = ctx.root_result_at(SLOT_DST + i as u32);
-        let bytes = word.to_ne_bytes();
-        let copy_n = (dst_size - i).min(8);
-        out[i..i + copy_n].copy_from_slice(&bytes[..copy_n]);
-        i += 8;
-    }
-    Ok(out)
+        let mut out = vec![0u8; dst_size];
+        let mut i = 0usize;
+        while i < dst_size {
+            let word = ctx.root_result_at(SLOT_DST + i as u32);
+            let bytes = word.to_ne_bytes();
+            let copy_n = (dst_size - i).min(8);
+            out[i..i + copy_n].copy_from_slice(&bytes[..copy_n]);
+            i += 8;
+        }
+        Ok(out)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,8 +1219,13 @@ macro_rules! impl_cast_type_wide {
                 )
             }
 
+            // Rendered through `BigInt` rather than the type's own `Display`,
+            // which reaches a `ethnum` formatting path that violates Stacked
+            // Borrows and aborts the whole binary under Miri. Decimal output is
+            // identical either way.
             fn decode(bytes: &[u8]) -> String {
-                <$ty>::from_le_bytes(bytes.try_into().unwrap()).to_string()
+                assert_eq!(bytes.len(), Self::WIDTH);
+                $bytes_to_big(bytes).to_string()
             }
 
             fn strategy() -> BoxedStrategy<Self> {

@@ -254,9 +254,7 @@ pub const ENUM_MODIFIER: &str = "enum";
 /// chain can be wildcards (`*`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AccessSpecifier_ {
-    Acquires(bool, NameAccessChain, Option<Vec<Type>>, AddressSpecifier),
-    Reads(bool, NameAccessChain, Option<Vec<Type>>, AddressSpecifier),
-    Writes(bool, NameAccessChain, Option<Vec<Type>>, AddressSpecifier),
+    Acquires(NameAccessChain, Option<Vec<Type>>, AddressSpecifier),
 }
 
 pub type AccessSpecifier = Spanned<AccessSpecifier_>;
@@ -470,6 +468,9 @@ pub enum SpecBlockMember_ {
     },
     Variable {
         is_global: bool,
+        /// Ghost struct field, declared in a struct spec block: model-only
+        /// state carried by each value of the struct.
+        is_ghost: bool,
         name: Name,
         type_parameters: Vec<(Name, Vec<Ability>)>,
         type_: Type,
@@ -733,6 +734,13 @@ pub enum BehaviorKind {
     EnsuresOf,
     /// `result_of<f>(x)` - deterministic result selector based on `ensures_of`
     ResultOf,
+    /// `unchanged_of<f>(x)` - the global memory `f` may modify at the given
+    /// arguments is unchanged relative to the pre-state
+    UnchangedOf,
+    /// `folds_of<f>(v, i)` / `folds_of<f>(g, i)` - the values written by `f`
+    /// to its captured variables over the first `i` iterations are the fold
+    /// of a derived accumulator transformer, and no prefix iteration aborts
+    FoldsOf,
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -808,9 +816,16 @@ pub enum Exp_ {
     // if (eb) et else ef
     IfElse(Box<Exp>, Box<Exp>, Option<Box<Exp>>),
     // [label] while (eb) eloop
+    // TODO: give `while` a dedicated spec field like `For` below, instead of
+    // folding a trailing spec into the condition (see `parse_spec_while_loop`).
     While(Option<Label>, Box<Exp>, Box<Exp>),
     // [label] loop eloop
     Loop(Option<Label>, Box<Exp>),
+    // for (iter in lb..ub [spec]) ebody [spec]
+    // The optional spec expression (`Exp_::Spec`) holds loop invariants declared
+    // either in the loop header (before the body) or in a trailing spec block
+    // (after the body); the two forms are mutually exclusive.
+    For(Var, Box<Exp>, Box<Exp>, Box<Exp>, Option<Box<Exp>>),
     // match (e) { b1 [ if c_1] => e1, ... }
     Match(Box<Exp>, Vec<Spanned<(BindList, Option<Exp>, Exp)>>),
 
@@ -1699,12 +1714,15 @@ impl AstDebug for SpecBlockMember_ {
             },
             SpecBlockMember_::Variable {
                 is_global,
+                is_ghost,
                 name,
                 type_parameters,
                 type_,
                 init: _,
             } => {
-                if *is_global {
+                if *is_ghost {
+                    w.write("ghost ");
+                } else if *is_global {
                     w.write("global ");
                 } else {
                     w.write("local");
@@ -2274,6 +2292,20 @@ impl AstDebug for Exp_ {
                 w.write("loop ");
                 e.ast_debug(w);
             },
+            E::For(iter, lb, ub, body, spec) => {
+                w.write("for (");
+                w.write(iter.0.value.as_str());
+                w.write(" in ");
+                lb.ast_debug(w);
+                w.write("..");
+                ub.ast_debug(w);
+                if let Some(spec) = spec {
+                    w.write(" ");
+                    spec.ast_debug(w);
+                }
+                w.write(") ");
+                body.ast_debug(w);
+            },
             E::Block(seq) => w.block(|w| seq.ast_debug(w)),
             E::Lambda(sp!(_, tbs), e, capture_kind, spec_opt) => {
                 if *capture_kind != LambdaCaptureKind::Default {
@@ -2409,6 +2441,8 @@ impl AstDebug for Exp_ {
                     BehaviorKind::AbortsOf => "aborts_of",
                     BehaviorKind::EnsuresOf => "ensures_of",
                     BehaviorKind::ResultOf => "result_of",
+                    BehaviorKind::UnchangedOf => "unchanged_of",
+                    BehaviorKind::FoldsOf => "folds_of",
                 };
                 w.write(kind_str);
                 w.write("<");

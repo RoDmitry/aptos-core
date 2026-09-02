@@ -17,7 +17,7 @@ use aptos_data_streaming_service::{
 use aptos_executor_types::{ChunkCommitNotification, ChunkExecutorTrait};
 use aptos_storage_interface::{
     chunk_to_commit::ChunkToCommit, DbReader, DbReaderWriter, DbWriter, LedgerSummary, Result,
-    StateSnapshotReceiver,
+    StateKind, StateSnapshotReceiver,
 };
 use aptos_types::{
     epoch_change::EpochChangeProof,
@@ -116,6 +116,9 @@ pub fn create_ready_storage_synchronizer(expect_reset_executor: bool) -> MockSto
     let mut mock_storage_synchronizer = create_mock_storage_synchronizer();
     mock_storage_synchronizer
         .expect_pending_storage_data()
+        .return_const(false);
+    mock_storage_synchronizer
+        .expect_pending_storage_data_error()
         .return_const(false);
     if expect_reset_executor {
         mock_storage_synchronizer
@@ -263,13 +266,14 @@ mock! {
             ledger_version: Version,
         ) -> Result<TransactionAccumulatorSummary>;
 
-        fn get_state_item_count(&self, version: Version) -> Result<usize>;
+        fn get_state_item_count(&self, version: Version, kind: StateKind) -> Result<usize>;
 
         fn get_state_value_chunk_with_proof(
             &self,
             version: Version,
             start_idx: usize,
             chunk_size: usize,
+            kind: StateKind,
         ) -> Result<StateValueChunkWithProof>;
 
         fn get_epoch_snapshot_prune_window(&self) -> Result<usize>;
@@ -284,6 +288,7 @@ mock! {
             &self,
             version: Version,
             expected_root_hash: HashValue,
+            kind: StateKind,
         ) -> Result<Box<dyn StateSnapshotReceiver<StateKey, StateValue>>>;
 
         fn finalize_state_snapshot(
@@ -309,20 +314,26 @@ mock! {
         fn is_snapshot_sync_complete(
             &self,
             target_ledger_info: &LedgerInfoWithSignatures,
+            kind: StateKind,
         ) -> Result<bool, Error>;
 
-        fn get_last_persisted_state_value_index(
+        fn get_last_persisted_index(
             &self,
             target_ledger_info: &LedgerInfoWithSignatures,
+            kind: StateKind,
         ) -> Result<u64, Error>;
 
-        fn previous_snapshot_sync_target(&self) -> Result<Option<LedgerInfoWithSignatures>, Error>;
+        fn previous_snapshot_sync_target(
+            &self,
+            kind: StateKind,
+        ) -> Result<Option<LedgerInfoWithSignatures>, Error>;
 
-        fn update_last_persisted_state_value_index(
+        fn update_last_persisted_index(
             &self,
             target_ledger_info: &LedgerInfoWithSignatures,
-            last_persisted_state_value_index: u64,
+            last_persisted_index: u64,
             snapshot_sync_completed: bool,
+            kind: StateKind,
         ) -> Result<(), Error>;
     }
 
@@ -352,6 +363,7 @@ mock! {
             &self,
             version: Version,
             start_index: Option<u64>,
+            state_kind: StateKind,
         ) -> AnyhowResult<DataStreamListener, aptos_data_streaming_service::error::Error>;
 
         async fn get_all_epoch_ending_ledger_infos(
@@ -437,19 +449,30 @@ mock! {
             end_of_epoch_ledger_info: Option<LedgerInfoWithSignatures>,
         ) -> AnyhowResult<(), crate::error::Error>;
 
-        fn initialize_state_synchronizer(
+        fn initialize_snapshot_synchronizer(
             &mut self,
-            epoch_change_proofs: Vec<LedgerInfoWithSignatures>,
             target_ledger_info: LedgerInfoWithSignatures,
-            target_output_with_proof: TransactionOutputListWithProofV2,
+            expected_root: HashValue,
+            kind: StateKind,
         ) -> AnyhowResult<JoinHandle<()>, crate::error::Error>;
 
         fn pending_storage_data(&self) -> bool;
+
+        fn pending_storage_data_error(&self) -> bool;
+
+        fn acknowledge_storage_data_error(&self);
 
         async fn save_state_values(
             &mut self,
             notification_id: NotificationId,
             state_value_chunk_with_proof: StateValueChunkWithProof,
+        ) -> AnyhowResult<(), crate::error::Error>;
+
+        async fn finalize_fast_sync(
+            &mut self,
+            epoch_change_proofs: Vec<LedgerInfoWithSignatures>,
+            target_ledger_info: LedgerInfoWithSignatures,
+            target_output_with_proof: TransactionOutputListWithProofV2,
         ) -> AnyhowResult<(), crate::error::Error>;
 
         fn reset_chunk_executor(&self) -> AnyhowResult<(), crate::error::Error>;

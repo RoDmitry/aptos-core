@@ -174,6 +174,10 @@ pub enum FeatureFlag {
     NativeCollateral,
     ComputeTradingNativeStateRoots,
     HotStateRootInTxnInfo,
+    GasRefundFaMint,
+    FunctionValueDispatch,
+    DisableClosureBcsSerialization,
+    LazyModuleInitialization,
 }
 
 fn generate_features_blob(writer: &CodeWriter, data: &[u64]) {
@@ -384,7 +388,7 @@ impl From<FeatureFlag> for AptosFeatureFlag {
             },
             FeatureFlag::EnableEnumTypes => AptosFeatureFlag::ENABLE_ENUM_TYPES,
             FeatureFlag::EnableResourceAccessControl => {
-                AptosFeatureFlag::ENABLE_RESOURCE_ACCESS_CONTROL
+                AptosFeatureFlag::_DEPRECATED_ENABLE_RESOURCE_ACCESS_CONTROL
             },
             FeatureFlag::RejectUnstableBytecodeForScript => {
                 AptosFeatureFlag::_REJECT_UNSTABLE_BYTECODE_FOR_SCRIPT
@@ -402,7 +406,7 @@ impl From<FeatureFlag> for AptosFeatureFlag {
             FeatureFlag::EnableCallTreeAndInstructionVMCache => {
                 AptosFeatureFlag::ENABLE_CALL_TREE_AND_INSTRUCTION_VM_CACHE
             },
-            FeatureFlag::PermissionedSigner => AptosFeatureFlag::PERMISSIONED_SIGNER,
+            FeatureFlag::PermissionedSigner => AptosFeatureFlag::_DEPRECATED_PERMISSIONED_SIGNER,
             FeatureFlag::AccountAbstraction => AptosFeatureFlag::ACCOUNT_ABSTRACTION,
             FeatureFlag::BulletproofsBatchNatives => AptosFeatureFlag::BULLETPROOFS_BATCH_NATIVES,
             FeatureFlag::DerivableAccountAbstraction => {
@@ -453,6 +457,12 @@ impl From<FeatureFlag> for AptosFeatureFlag {
                 AptosFeatureFlag::COMPUTE_TRADING_NATIVE_STATE_ROOTS
             },
             FeatureFlag::HotStateRootInTxnInfo => AptosFeatureFlag::HOT_STATE_ROOT_IN_TXN_INFO,
+            FeatureFlag::GasRefundFaMint => AptosFeatureFlag::GAS_REFUND_FA_MINT,
+            FeatureFlag::FunctionValueDispatch => AptosFeatureFlag::FUNCTION_VALUE_DISPATCH,
+            FeatureFlag::DisableClosureBcsSerialization => {
+                AptosFeatureFlag::DISABLE_CLOSURE_BCS_SERIALIZATION
+            },
+            FeatureFlag::LazyModuleInitialization => AptosFeatureFlag::LAZY_MODULE_INITIALIZATION,
         }
     }
 }
@@ -589,7 +599,7 @@ impl From<AptosFeatureFlag> for FeatureFlag {
                 FeatureFlag::UseCompatibilityCheckerV2
             },
             AptosFeatureFlag::ENABLE_ENUM_TYPES => FeatureFlag::EnableEnumTypes,
-            AptosFeatureFlag::ENABLE_RESOURCE_ACCESS_CONTROL => {
+            AptosFeatureFlag::_DEPRECATED_ENABLE_RESOURCE_ACCESS_CONTROL => {
                 FeatureFlag::EnableResourceAccessControl
             },
             AptosFeatureFlag::_REJECT_UNSTABLE_BYTECODE_FOR_SCRIPT => {
@@ -608,7 +618,7 @@ impl From<AptosFeatureFlag> for FeatureFlag {
             AptosFeatureFlag::ENABLE_CALL_TREE_AND_INSTRUCTION_VM_CACHE => {
                 FeatureFlag::EnableCallTreeAndInstructionVMCache
             },
-            AptosFeatureFlag::PERMISSIONED_SIGNER => FeatureFlag::PermissionedSigner,
+            AptosFeatureFlag::_DEPRECATED_PERMISSIONED_SIGNER => FeatureFlag::PermissionedSigner,
             AptosFeatureFlag::ACCOUNT_ABSTRACTION => FeatureFlag::AccountAbstraction,
             AptosFeatureFlag::BULLETPROOFS_BATCH_NATIVES => FeatureFlag::BulletproofsBatchNatives,
             AptosFeatureFlag::DERIVABLE_ACCOUNT_ABSTRACTION => {
@@ -659,6 +669,12 @@ impl From<AptosFeatureFlag> for FeatureFlag {
                 FeatureFlag::ComputeTradingNativeStateRoots
             },
             AptosFeatureFlag::HOT_STATE_ROOT_IN_TXN_INFO => FeatureFlag::HotStateRootInTxnInfo,
+            AptosFeatureFlag::GAS_REFUND_FA_MINT => FeatureFlag::GasRefundFaMint,
+            AptosFeatureFlag::FUNCTION_VALUE_DISPATCH => FeatureFlag::FunctionValueDispatch,
+            AptosFeatureFlag::DISABLE_CLOSURE_BCS_SERIALIZATION => {
+                FeatureFlag::DisableClosureBcsSerialization
+            },
+            AptosFeatureFlag::LAZY_MODULE_INITIALIZATION => FeatureFlag::LazyModuleInitialization,
         }
     }
 }

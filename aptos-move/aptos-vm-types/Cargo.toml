@@ -29,6 +29,7 @@ move-core-types = { workspace = true }
 move-vm-runtime = { workspace = true }
 move-vm-types = { workspace = true }
 rand = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 triomphe = { workspace = true }
 
@@ -38,3 +39,6 @@ aptos-gas-schedule = { workspace = true, features = ["testing"] }
 aptos-transaction-simulation = { workspace = true }
 aptos-vm = { workspace = true }
 test-case = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

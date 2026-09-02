@@ -4,7 +4,7 @@ module std::option {
     use std::mem;
 
     /// Abstraction of a value that may or may not be present.
-    enum Option<Element> has copy, drop, store {
+    public enum Option<Element> has copy, drop, store {
         None,
         Some {
             e: Element,
@@ -376,8 +376,11 @@ module std::option {
 
     /// Utility function to destroy an option that is not droppable.
     public inline fun destroy<Element>(self: Option<Element>, d: |Element|) {
-        let vec = self.to_vec();
-        vec.destroy(|e| d(e));
+        if (self.is_some()) {
+            d(self.destroy_some())
+        } else {
+            self.destroy_none()
+        }
     }
 
     spec module {} // switch documentation context back to module level

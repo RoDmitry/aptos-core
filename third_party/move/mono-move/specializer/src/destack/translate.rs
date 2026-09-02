@@ -5,9 +5,8 @@
 
 use super::ssa_conversion::SsaConverter;
 use crate::stackless_exec_ir::{FunctionIR, ModuleIR};
-use anyhow::Result;
-use mono_move_core::{Interner, PreparedModule};
-use move_binary_format::access::ModuleAccess;
+use mono_move_core::{Interner, PreparedModule, VMResult};
+use move_binary_format::{access::ModuleAccess, file_format::FunctionDefinitionIndex};
 
 /// Convert an entire compiled module to stackless IR.
 ///
@@ -37,11 +36,12 @@ use move_binary_format::access::ModuleAccess;
 ///   type-parameter list of the enclosing generic context.
 /// - **Reference safety**: the borrow checker guarantees that freed slots
 ///   truly hold dead values, so type-keyed slot recycling is sound.
-pub fn translate_module(module: PreparedModule, interner: &impl Interner) -> Result<ModuleIR> {
+pub fn translate_module(module: PreparedModule, interner: &impl Interner) -> VMResult<ModuleIR> {
     let functions = module
         .function_defs
         .iter()
-        .map(|fdef| {
+        .enumerate()
+        .map(|(def_position, fdef)| {
             let Some(code) = fdef.code.as_ref() else {
                 return Ok(None);
             };
@@ -59,27 +59,29 @@ pub fn translate_module(module: PreparedModule, interner: &impl Interner) -> Res
                 .collect::<Vec<_>>();
 
             // Pass: Bytecode -> Intra-Block SSA -> Fusion
-            let converter = SsaConverter::new(local_types, interner);
-            let ssa = converter
-                .convert_function(&module, &code.code)?
-                .with_fusion_passes()
-                .with_test_utils_passes(&module)?;
+            let converter = SsaConverter::new(local_types, &handle.type_parameters, interner);
+            let (ssa, witness) = converter.convert_function(&module, &code.code)?;
+            let ssa = ssa.with_fusion_passes()?.with_test_utils_passes(&module)?;
 
-            // Pass: Greedy Slot Allocation (consumes SSA, remaps in-place)
-            let alloc = super::slot_alloc::allocate_slots(ssa)?;
+            // Pass: Greedy Slot Allocation (consumes SSA, produces named-slot IR)
+            let alloc = super::slot_alloc::allocate_slots(ssa, &module)?;
 
             Ok(Some(FunctionIR {
                 name_idx,
                 handle_idx,
+                def_idx: FunctionDefinitionIndex(def_position as u16),
                 num_params,
                 num_locals,
                 num_home_slots: alloc.num_home_slots,
-                num_xfer_positions: alloc.num_xfer_positions,
+                num_transfer_positions: alloc.num_transfer_positions,
                 blocks: alloc.blocks,
                 home_slot_types: alloc.home_slot_types,
+                // Populated by the gas instrumentation pass.
+                block_costs: Vec::new(),
+                witness,
             }))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<VMResult<Vec<_>>>()?;
 
     Ok(ModuleIR { module, functions })
 }

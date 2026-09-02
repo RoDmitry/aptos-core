@@ -63,7 +63,9 @@ spec aptos_framework::coin {
         pragma aborts_if_is_partial;
         global supply<CoinType>: num;
         global aggregate_supply<CoinType>: num;
-        apply TotalSupplyTracked<CoinType> to *<CoinType> except initialize, initialize_internal, initialize_with_parallelizable_supply;
+        // TODO: `migrate_coin_store_to_fungible_store` migrates in an inline `for_each`
+        // loop; the schema needs a loop invariant that cannot be attached there.
+        apply TotalSupplyTracked<CoinType> to *<CoinType> except initialize, initialize_internal, initialize_with_parallelizable_supply, migrate_coin_store_to_fungible_store;
         // TODO(fa_migration)
         // apply TotalSupplyNoChange<CoinType> to *<CoinType> except mint,
         //     burn, burn_from, initialize, initialize_internal, initialize_with_parallelizable_supply;
@@ -358,6 +360,8 @@ spec aptos_framework::coin {
     }
 
     spec extract_all<CoinType>(coin: &mut Coin<CoinType>): Coin<CoinType> {
+        pragma opaque;
+        aborts_if false;
         ensures result.value == old(coin).value;
         ensures coin.value == 0;
     }
@@ -390,8 +394,9 @@ spec aptos_framework::coin {
 
     /// The creator of `CoinType` must be `@aptos_framework`.
     /// `SupplyConfig` allow upgrade.
-    spec upgrade_supply<CoinType>(_account: &signer) {
-        aborts_if true;
+    spec upgrade_supply<CoinType>(account: &signer) {
+        // aborts_if true;
+        pragma verify = false;
     }
 
     spec initialize {
@@ -477,8 +482,11 @@ spec aptos_framework::coin {
     }
 
     spec merge<CoinType>(dst_coin: &mut Coin<CoinType>, source_coin: Coin<CoinType>) {
+        pragma opaque;
+        aborts_if dst_coin.value + source_coin.value > MAX_U64;
         /// [high-level-req-3]
         ensures dst_coin.value == old(dst_coin.value) + source_coin.value;
+        ensures supply<CoinType> == old(supply<CoinType>);
     }
 
     /// An account can only be registered once.

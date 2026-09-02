@@ -5,10 +5,7 @@
 //! and a bump-allocated heap with copying GC.
 
 use crate::{
-    error::{
-        ArithOp, RuntimeError, RuntimeInvariantViolation, RuntimeResult, RuntimeStatus, Signedness,
-        VecOp,
-    },
+    error::{ArithOp, RuntimeError, RuntimeInvariantViolation, RuntimeStatus, Signedness, VecOp},
     global_storage::{EntryPtr, ResourceReadWriteSet},
     heap::{
         deep_copy_or_gc, deserialize_or_gc,
@@ -22,35 +19,64 @@ use crate::{
         write_bool, write_enum_tag, write_fat_ptr, write_ptr, write_u32, write_u64, write_u8,
         MemoryRegion,
     },
-    native_context::ProductionNativeContext,
+    native_context::{ProductionNativeContext, ProductionNativeRegistry},
     types::{
         ABORT_MESSAGE_SIZE_LIMIT, DEFAULT_HEAP_SIZE, DEFAULT_STACK_SIZE, META_SAVED_FP_OFFSET,
         META_SAVED_FUNC_PTR_OFFSET, META_SAVED_PC_OFFSET, VEC_DATA_OFFSET, VEC_LENGTH_OFFSET,
         VEC_PUSHBACK_INIT_CAPACITY,
     },
-    value_utils, ExecutionContext,
+    value_utils,
 };
 use mono_move_core::{
     captured_values_size,
+    interner::{module_id_of, InternedIdentifier, InternedModuleId},
     native::{
-        NativeABI, NativeExtensions, NativeIdx, NativeStatus, ObjectHandle, RootPool,
-        VMInternalError,
+        NativeABI, NativeExtension, NativeExtensions, NativeIdx, NativeStatus, ObjectHandle,
+        RootPool,
     },
     next_captured_value_offset,
     storage::resource_provider::InMemoryStorageKey,
-    types::{view_type_list, InternedType, InternedTypeList},
+    types::{view_type, view_type_list, InternedType, InternedTypeList, Type},
     CallClosureOp, ClosureFuncRef, CmpKind, CodeOffset, ConstantPoolIndex, DescriptorId,
-    DescriptorProvider, FrameOffset, Function, FunctionRef, IntBinaryOp, IntCastOp, IntNegateOp,
-    IntOperand, IntShiftOp, IntTy, LayoutProvider, MicroOp, PackClosureOp, ShiftOperand, VecPackOp,
-    VecUnpackOp, CAPTURED_DATA_TAG_MATERIALIZED, CAPTURED_DATA_TAG_OFFSET,
-    CAPTURED_DATA_VALUES_OFFSET, CAPTURED_DATA_VALUES_SIZE_OFFSET,
-    CLOSURE_CAPTURED_DATA_PTR_OFFSET, CLOSURE_DESCRIPTOR_ID, CLOSURE_FUNC_REF_OFFSET,
-    CLOSURE_MASK_OFFSET, FRAME_METADATA_SIZE, FUNC_REF_PAYLOAD_OFFSET, FUNC_REF_TAG_OFFSET,
-    FUNC_REF_TAG_RESOLVED, FUNC_REF_TAG_UNRESOLVED, MAX_ALIGN, OBJECT_HEADER_SIZE,
+    FrameOffset, Function, FunctionPtr, FunctionRef, GasMeter, IntBinaryOp, IntCastOp, IntNegateOp,
+    IntOperand, IntShiftOp, IntTy, LayoutProvider, MicroOp, PackClosureOp, ResourceProvider,
+    ShiftOperand, VMInternalError, VMResult, VecPackOp, VecUnpackOp,
+    CAPTURED_DATA_TAG_MATERIALIZED, CAPTURED_DATA_TAG_OFFSET, CAPTURED_DATA_VALUES_OFFSET,
+    CAPTURED_DATA_VALUES_SIZE_OFFSET, CLOSURE_CAPTURED_DATA_PTR_OFFSET, CLOSURE_DESCRIPTOR_ID,
+    CLOSURE_FUNC_REF_OFFSET, CLOSURE_MASK_OFFSET, FRAME_METADATA_SIZE, FUNC_REF_PAYLOAD_OFFSET,
+    FUNC_REF_TAG_OFFSET, FUNC_REF_TAG_RESOLVED, FUNC_REF_TAG_UNRESOLVED, MAX_ALIGN,
+    OBJECT_HEADER_SIZE,
 };
-use move_core_types::int256::{I256, U256};
+use mono_move_global_context::ExecutionGuard;
+use mono_move_loader::{Loader, ModuleReadSet};
+use move_core_types::{
+    int256::{I256, U256},
+    vm_status::AbortLocation,
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use std::ptr::{null, NonNull};
+use std::{
+    cell::Ref,
+    ptr::{null, NonNull},
+};
+
+/// Resolves the resource-group container a resource type belongs to from the
+/// read-set-pinned defining module, or [`None`] for an own storage slot.
+macro_rules! resolve_resource_group {
+    ($ctx:expr, $ty:expr) => {{
+        let Type::Nominal {
+            module_id, name, ..
+        } = view_type($ty)
+        else {
+            // Global-storage ops always operate on nominal (struct/enum) types.
+            invariant_violation!(Unreachable(
+                "resource type must be a nominal type".to_string()
+            ));
+        };
+        let arena_ref = $ctx.loader.guard().arena_ref_for_module_id(*module_id);
+        Ok($ctx.read_set.get_loaded(arena_ref)?.resource_group_of(name))
+    }};
+}
+
 // ---------------------------------------------------------------------------
 // Runtime state
 // ---------------------------------------------------------------------------
@@ -74,29 +100,147 @@ pub(crate) struct VMRegisters {
 }
 
 impl VMRegisters {
+    /// Sentinel `pc` marking a context with no function installed yet.
+    /// Guarded at every entry point that would touch the registers, so the
+    /// dangling function pointer is never dereferenced.
+    const IDLE_PC: usize = usize::MAX;
+
     /// Registers initialized with a fresh root frame, ready to begin execution.
-    fn new(stack_base: *mut u8, func: &Function) -> Self {
+    fn new(stack: &MemoryRegion, func: &Function) -> Self {
         Self {
             pc: 0,
-            // SAFETY: `stack_base` points to a stack allocation far larger than
-            // `FRAME_METADATA_SIZE`, so the offset stays in bounds.
-            fp: unsafe { stack_base.add(FRAME_METADATA_SIZE) },
+            fp: root_frame_base(stack),
             func: NonNull::from(func),
         }
     }
+
+    /// Registers of an idle context; [`Self::new`] via `prepare_call` must run
+    /// before execution.
+    //
+    // TODO(cleanup): `func` has no value until the first call, so this hands
+    // out a dangling pointer and leans on `is_idle` instead of the `NonNull`
+    // invariant. Look for ways to get rid of this workaround in the future.
+    fn idle(stack: &MemoryRegion) -> Self {
+        Self {
+            pc: Self::IDLE_PC,
+            fp: root_frame_base(stack),
+            func: NonNull::dangling(),
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pc == Self::IDLE_PC
+    }
 }
 
-/// Interpreter context with a unified call stack and a GC-managed heap.
-pub struct InterpreterContext<'a, T: ExecutionContext + DescriptorProvider + LayoutProvider> {
-    /// Per-transaction context (function resolution, gas counters,
-    /// descriptor table, etc.).
-    pub(crate) exec_ctx: &'a mut T,
+/// Frame pointer of the root call frame, which sits above the stack's sentinel
+/// frame metadata.
+fn root_frame_base(stack: &MemoryRegion) -> *mut u8 {
+    assert!(
+        stack.len() > FRAME_METADATA_SIZE,
+        "stack is too small to hold a root frame"
+    );
+    // SAFETY: the offset is within `stack`, checked above.
+    unsafe { stack.as_ptr().add(FRAME_METADATA_SIZE) }
+}
+
+/// What a finished transaction leaves behind: the frozen heap, the
+/// global-storage read-write set, and the native extensions (event store and
+/// friends).
+///
+/// Read-write-set and extension entries point into the frozen heap, so the
+/// parts are only valid together. Read-write-set keys and some extension
+/// entries, notably emitted events, contain interned types backed by the global
+/// arena. Retaining the originating execution guard prevents arena-resetting
+/// maintenance while the effects exist and supplies the matching layout table
+/// during materialization. Retaining the exact resource provider used during
+/// execution keeps its external read allocations alive and lets materializers
+/// reject another provider whose pointer-keyed caches or state snapshot do not
+/// match these effects.
+pub struct SessionEffects<'guard> {
+    read_write_set: ResourceReadWriteSet,
+    extensions: NativeExtensions,
+    /// The guard whose layout table describes the effects' interned types.
+    guard: &'guard ExecutionGuard<'guard>,
+    /// The exact provider that supplied external reads during execution.
+    resource_provider: &'guard dyn ResourceProvider,
+    /// Owns the allocations referenced by the read-write set and extensions.
+    /// Not read directly: those hold raw pointers into it, so it only needs to
+    /// outlive them. Declared last because fields drop in declaration order.
+    _heap: Heap,
+}
+
+impl<'guard> SessionEffects<'guard> {
+    /// The transaction's global-storage read-write set.
+    pub fn read_write_set(&self) -> &ResourceReadWriteSet {
+        &self.read_write_set
+    }
+
+    /// Immutable access to one of the transaction's native extensions.
+    pub fn extension<T: NativeExtension>(&self) -> VMResult<Ref<'_, T>> {
+        self.extensions.get::<T>()
+    }
+
+    /// The originating layout provider for the effects' interned types.
+    #[inline]
+    pub fn layout_provider(&self) -> &impl LayoutProvider {
+        self.guard
+    }
+
+    /// Whether `provider` is the exact provider instance used during execution.
+    ///
+    /// Identity matters because storage keys and provider caches can contain
+    /// pointer-identified interned types.
+    pub fn originates_from_provider(&self, provider: &dyn ResourceProvider) -> bool {
+        std::ptr::addr_eq(self.resource_provider, provider)
+    }
+}
+
+/// Materializes the [`AbortLocation`] naming the module that raised an abort.
+// TODO(completeness): return `AbortLocation::Script` for script aborts.
+fn abort_location(module_id: InternedModuleId) -> VMResult<AbortLocation> {
+    match module_id_of(module_id) {
+        Some(module_id) => Ok(AbortLocation::Module(module_id)),
+        None => invariant_violation!(Unreachable(
+            "interned module name is not a valid identifier".to_string()
+        )),
+    }
+}
+
+/// Per-transaction interpreter context with a unified call stack and a
+/// GC-managed heap: owns the transaction state (code loader and read-set, gas
+/// meter, native extensions, resource read-write set) and the machine state
+/// (stack, heap, VM registers). Interpreter sessions are [`Self::prepare_call`] /
+/// [`Self::reset`] calls on the same context, so state like the heap and the
+/// read-write set lives across sessions within one transaction.
+///
+/// Construction wires in the transaction inputs (loader, read-set and gas
+/// meter carried over from loading the entry function, resource provider,
+/// natives) and verifies the entry function; further sessions reuse the
+/// buffers via [`reset`](Self::reset).
+pub struct InterpreterContext<'guard> {
+    /// Per-transaction code loader; also the access point for the execution
+    /// guard (descriptor/layout lookups). The loader's global-context
+    /// lifetime is shrunk to `'guard` (covariance): nothing the interpreter
+    /// exposes outlives the guard.
+    pub(crate) loader: Loader<'guard, 'guard>,
+    /// Read-set of the modules loaded by this transaction.
+    read_set: ModuleReadSet<'guard>,
+    pub(crate) gas_meter: GasMeter,
+    // TODO(cleanup): Move the native registry off the per-transaction context
+    // and onto a long-lived owner (e.g. the global context).
+    //
+    // TODO(correctness): Enforce that `natives` here and the `NativeResolver`
+    // passed to `loader` are the same instance.
+    natives: &'guard ProductionNativeRegistry,
+    /// Per-transaction native extensions, shared across native calls.
+    pub(crate) extensions: NativeExtensions,
+    resource_provider: &'guard dyn ResourceProvider,
 
     /// The VM registers; the dispatch loop works on a local copy and writes it
     /// back here on exit.
     pub(crate) registers: VMRegisters,
-
-    pub(crate) stack: MemoryRegion,
+    stack: MemoryRegion,
     pub(crate) heap: Heap,
     /// Auxiliary GC root set for temporarily-live heap pointers that are
     /// not yet stored in any frame slot (e.g. between two allocations in a
@@ -109,14 +253,41 @@ pub struct InterpreterContext<'a, T: ExecutionContext + DescriptorProvider + Lay
     rng: StdRng,
 }
 
-impl<'a, T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterContext<'a, T> {
-    pub fn new(exec_ctx: &'a mut T, entry: &Function) -> Self {
-        Self::with_heap_size(exec_ctx, entry, DEFAULT_HEAP_SIZE)
+impl<'guard> InterpreterContext<'guard> {
+    pub fn new(
+        loader: Loader<'guard, 'guard>,
+        read_set: ModuleReadSet<'guard>,
+        gas_meter: GasMeter,
+        resource_provider: &'guard dyn ResourceProvider,
+        natives: &'guard ProductionNativeRegistry,
+        entry: &Function,
+    ) -> Self {
+        Self::with_heap_size(
+            loader,
+            read_set,
+            gas_meter,
+            resource_provider,
+            natives,
+            entry,
+            DEFAULT_HEAP_SIZE,
+        )
     }
 
     /// Create a new context with a custom heap size (for testing GC pressure).
-    pub fn with_heap_size(exec_ctx: &'a mut T, entry: &Function, heap_size: usize) -> Self {
-        let verification_errors = crate::verifier::verify_function(entry, exec_ctx);
+    /// Verifies `entry` and installs it, ready for [`run`](Self::run); panics
+    /// if verification fails. `read_set` and `gas_meter` carry over the
+    /// entry-load state (the entry's module must be in the read-set for its
+    /// constants and call targets to resolve).
+    pub fn with_heap_size(
+        loader: Loader<'guard, 'guard>,
+        read_set: ModuleReadSet<'guard>,
+        gas_meter: GasMeter,
+        resource_provider: &'guard dyn ResourceProvider,
+        natives: &'guard ProductionNativeRegistry,
+        entry: &Function,
+        heap_size: usize,
+    ) -> Self {
+        let verification_errors = crate::verifier::verify_function(entry, loader.guard());
         assert!(
             verification_errors.is_empty(),
             "verification failed:\n{}",
@@ -127,7 +298,7 @@ impl<'a, T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterC
                 .join("\n")
         );
 
-        let stack = MemoryRegion::new(DEFAULT_STACK_SIZE);
+        let stack = MemoryRegion::new_zeroed(DEFAULT_STACK_SIZE);
         let base = stack.as_ptr();
 
         unsafe {
@@ -137,14 +308,108 @@ impl<'a, T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterC
         }
 
         Self {
-            exec_ctx,
-            registers: VMRegisters::new(base, entry),
+            loader,
+            read_set,
+            gas_meter,
+            natives,
+            extensions: NativeExtensions::new(),
+            resource_provider,
+            registers: VMRegisters::new(&stack, entry),
             stack,
             heap: Heap::new(heap_size),
             root_pool: RootPool::new(),
             read_write_set: ResourceReadWriteSet::new(),
             rng: StdRng::seed_from_u64(0),
         }
+    }
+
+    /// Creates a context with no function installed and an empty read-set:
+    /// for drivers that resolve their first function through the context
+    /// itself. [`prepare_call`](Self::prepare_call) must run before execution.
+    pub fn new_idle(
+        loader: Loader<'guard, 'guard>,
+        gas_meter: GasMeter,
+        resource_provider: &'guard dyn ResourceProvider,
+        natives: &'guard ProductionNativeRegistry,
+    ) -> Self {
+        let stack = MemoryRegion::new_zeroed(DEFAULT_STACK_SIZE);
+        let base = stack.as_ptr();
+
+        unsafe {
+            write_u64(base, META_SAVED_PC_OFFSET, 0);
+            write_u64(base, META_SAVED_FP_OFFSET, 0);
+            write_ptr(base, META_SAVED_FUNC_PTR_OFFSET, null());
+        }
+
+        Self {
+            loader,
+            read_set: ModuleReadSet::new(),
+            gas_meter,
+            natives,
+            extensions: NativeExtensions::new(),
+            resource_provider,
+            registers: VMRegisters::idle(&stack),
+            stack,
+            heap: Heap::new(DEFAULT_HEAP_SIZE),
+            root_pool: RootPool::new(),
+            read_write_set: ResourceReadWriteSet::new(),
+            rng: StdRng::seed_from_u64(0),
+        }
+    }
+
+    /// Install the per-transaction native extensions. Replaces any previously
+    /// installed set.
+    pub fn with_extensions(mut self, extensions: NativeExtensions) -> Self {
+        self.extensions = extensions;
+        self
+    }
+
+    /// Resolve a runtime function call: look the target up in the read-set,
+    /// falling back to the [`Loader`] on cache miss. May trigger lazy module
+    /// loading, gas charge on a cache miss, and lowering of the function's
+    /// code.
+    pub fn load_function(
+        &mut self,
+        module_id: InternedModuleId,
+        name: InternedIdentifier,
+        ty_args: InternedTypeList,
+    ) -> VMResult<FunctionPtr> {
+        self.loader.load_function(
+            &mut self.read_set,
+            &mut self.gas_meter,
+            module_id,
+            name,
+            ty_args,
+        )
+    }
+
+    /// Resolve a constant from `module_id`'s constant pool, returning its
+    /// interned type and BCS bytes. The calling function was loaded from
+    /// `module_id`, so the module is always present and loaded in the read
+    /// set; a missing or not-yet-loaded entry is an invariant violation.
+    fn load_constant(
+        &self,
+        module_id: InternedModuleId,
+        idx: ConstantPoolIndex,
+    ) -> VMResult<(InternedType, &'guard [u8])> {
+        let arena_ref = self.loader.guard().arena_ref_for_module_id(module_id);
+        let module = &self.read_set.get_loaded(arena_ref)?.ir().module;
+        Ok((
+            module.interned_constant_type_at(idx),
+            module.constant_data_at(idx),
+        ))
+    }
+
+    /// Resolves the resource-group container a resource type belongs to, or
+    /// [`None`] if it lives in its own storage slot. Membership is read from the
+    /// resource's defining module, which must be available.
+    fn resource_group_of(&self, ty: InternedType) -> VMResult<Option<InternedType>> {
+        resolve_resource_group!(self, ty)
+    }
+
+    /// Returns the transaction's read-set.
+    pub fn read_set(&self) -> &ModuleReadSet<'guard> {
+        &self.read_set
     }
 
     pub fn set_rng_seed(&mut self, seed: u64) {
@@ -161,63 +426,80 @@ impl<'a, T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterC
     }
 
     pub fn extensions(&self) -> &NativeExtensions {
-        self.exec_ctx.extensions()
+        &self.extensions
     }
 
     /// Takes a checkpoint (opening a new sub-session): checkpoints the
     /// read-write set and signals every native extension. The two advance in
     /// lockstep, so a single [`Self::rollback`] depth undoes a checkpoint's
     /// effects across both.
-    //
-    // TODO(cleanup): move to execution context
-    pub fn checkpoint(&mut self) -> RuntimeResult<()> {
+    pub fn checkpoint(&mut self) -> VMResult<()> {
         self.read_write_set.checkpoint();
-        self.exec_ctx
-            .extensions()
-            .checkpoint()
-            .map_err(VMInternalError::into_runtime_error)
+        self.extensions.checkpoint()
     }
 
     /// Rolls back the `n` most recent checkpoints across the read-write set and
     /// every native extension. `n == 0` is a no-op; `n` beyond the current
     /// depth is an invariant violation. The read-write set rolls back first, so
     /// an underflow is caught before any extension is touched.
-    //
-    // TODO(cleanup): move to execution context
-    pub fn rollback(&mut self, n: usize) -> RuntimeResult<()> {
+    pub fn rollback(&mut self, n: usize) -> VMResult<()> {
         self.read_write_set.rollback(n)?;
-        self.exec_ctx
-            .extensions()
-            .rollback(n)
-            .map_err(VMInternalError::into_runtime_error)
+        self.extensions.rollback(n)
     }
 
-    /// TODO(cleanup): move to execution context
     pub fn checkpoint_depth(&self) -> usize {
         self.read_write_set.checkpoint_depth()
     }
 
-    /// TODO(cleanup): move to execution context
     pub fn current_epoch(&self) -> u64 {
         self.read_write_set.current_epoch()
     }
 
-    /// TODO(cleanup): move to execution context
     pub fn journal_len(&self) -> usize {
         self.read_write_set.journal_len()
+    }
+
+    /// Remaining gas balance.
+    pub fn gas_balance(&self) -> u64 {
+        self.gas_meter.balance()
+    }
+
+    /// Consumes the context, returning the transaction's side effects for
+    /// publication. No execution can follow, so the heap is frozen and every
+    /// heap pointer inside the read-write set and extensions stays valid for
+    /// as long as the returned effects live. Retaining the originating guard
+    /// also prevents the global arena that owns their interned types from being
+    /// reset and supplies the matching layout table during materialization.
+    pub fn finish(self) -> SessionEffects<'guard> {
+        let guard = self.loader.guard();
+        SessionEffects {
+            read_write_set: self.read_write_set,
+            extensions: self.extensions,
+            guard,
+            resource_provider: self.resource_provider,
+            _heap: self.heap,
+        }
+    }
+
+    /// Runs `f` with gas metering suspended: the meter is swapped for an
+    /// effectively unbounded one and restored afterwards, so loads and
+    /// execution inside `f` never touch the transaction's budget. Used for
+    /// system code (prologue, epilogue) that runs unmetered by design.
+    pub fn unmetered<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = std::mem::replace(&mut self.gas_meter, GasMeter::with_max_budget());
+        let result = f(self);
+        self.gas_meter = saved;
+        result
     }
 
     /// Reset the context to call a different function, preserving the heap.
     ///
     /// Use `set_root_arg` to place arguments before calling `run()`.
-    ///
-    // TODO(cleanup): invoke() is test-only for now. When used with real gas budgets,
-    // decide whether to reset the gas meter here.
-    pub fn invoke(&mut self, func: &Function) {
+    pub fn prepare_call(&mut self, func: &Function) {
         let base = self.stack.as_ptr();
 
         // Reset execution state to root frame.
-        self.registers = VMRegisters::new(base, func);
+        self.registers = VMRegisters::new(&self.stack, func);
 
         // Re-write sentinel metadata so Return from root triggers Done.
         unsafe {
@@ -243,11 +525,12 @@ impl<'a, T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterC
     /// stack and heap buffers instead of reallocating them. Place arguments with
     /// [`set_root_arg`](Self::set_root_arg) before calling [`run`](Self::run).
     pub fn reset(&mut self, func: &Function, gas_budget: u64) {
-        self.invoke(func);
+        self.prepare_call(func);
         self.heap.reset();
         self.read_write_set = ResourceReadWriteSet::new();
         self.root_pool = RootPool::new();
-        self.exec_ctx.gas_meter().reset(gas_budget);
+        self.gas_meter.reset(gas_budget);
+        self.rng = StdRng::seed_from_u64(0);
     }
 
     /// Read a u64 from the root frame's slot 0 (where the result lands).
@@ -287,6 +570,23 @@ impl<'a, T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterC
         }
     }
 
+    /// Reads a heap `vector<u64>` from the root result slot at `offset`; empty if
+    /// the pointer is null. For tests.
+    pub fn root_result_u64_vector_for_test(&self, offset: u32) -> Vec<u64> {
+        // SAFETY: the slot holds a live pointer to a heap vector<u64>; the heap is
+        // still owned by this context, so the reads stay in bounds.
+        unsafe {
+            let ptr = read_ptr(self.stack.as_ptr(), FRAME_METADATA_SIZE + offset as usize);
+            if ptr.is_null() {
+                return vec![];
+            }
+            let len = read_u64(ptr, VEC_LENGTH_OFFSET) as usize;
+            (0..len)
+                .map(|i| read_u64(ptr, VEC_DATA_OFFSET + i * 8))
+                .collect()
+        }
+    }
+
     /// Copy argument bytes into the root frame at the given byte offset.
     pub fn set_root_arg(&mut self, offset: u32, arg: &[u8]) {
         unsafe {
@@ -296,6 +596,25 @@ impl<'a, T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterC
                 .add(FRAME_METADATA_SIZE + offset as usize);
             std::ptr::copy_nonoverlapping(arg.as_ptr(), dst, arg.len());
         }
+    }
+
+    /// Place a reference to `target` in the root frame at the given byte offset.
+    ///
+    /// # Safety
+    ///
+    /// `target` must stay valid and pinned until the call finishes. Pointing
+    /// outside the VM heap also keeps it away from the GC.
+    pub unsafe fn set_root_ref_arg(&mut self, offset: u32, target: *const u8) {
+        // SAFETY: the offset is a parameter slot of the root frame, so it is
+        // within the stack and wide enough for a reference.
+        unsafe {
+            write_fat_ptr(
+                self.stack.as_ptr(),
+                FRAME_METADATA_SIZE + offset as usize,
+                target,
+                0,
+            )
+        };
     }
 
     /// Read a raw heap pointer from the root frame at the given byte offset.
@@ -315,25 +634,28 @@ impl<'a, T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterC
         offset: u32,
         ty: InternedType,
         bytes: &[u8],
-    ) -> RuntimeResult<()> {
+    ) -> VMResult<()> {
         let dst = unsafe {
             self.stack
                 .as_ptr()
                 .add(FRAME_METADATA_SIZE + offset as usize)
         };
         // SAFETY: `dst` is a slot in the root frame (caller guarantees offset/ty match a
-        // parameter); `exec_ctx` is the LayoutProvider and `heap` is where nested data is boxed.
-        unsafe { value_utils::deserialize_into(&*self.exec_ctx, &mut self.heap, ty, bytes, dst) }
+        // parameter); the guard is the LayoutProvider and `heap` is where nested data is boxed.
+        unsafe {
+            value_utils::deserialize_into(self.loader.guard(), &mut self.heap, ty, bytes, dst)
+        }
     }
 
     /// Allocate a vector of `u64` values on the heap and return its address
     /// as a `u64` suitable for embedding in args. Useful for passing pre-built
     /// data into a program without generating initialization micro-ops.
-    pub fn alloc_u64_vec(
-        &mut self,
-        descriptor_id: DescriptorId,
-        values: &[u64],
-    ) -> RuntimeResult<u64> {
+    pub fn alloc_u64_vec(&mut self, descriptor_id: DescriptorId, values: &[u64]) -> VMResult<u64> {
+        if self.registers.is_idle() {
+            invariant_violation!(Unreachable(
+                "allocation on an idle context: no call was prepared".to_string()
+            ));
+        }
         let n = values.len() as u64;
         let ptr = alloc_vec!(
             self,
@@ -522,6 +844,44 @@ fn u256_from_u8(x: u8) -> U256 {
     U256::from_le_bytes(bytes)
 }
 
+/// Resolve the enum fat pointer at `enum_ref` and its runtime tag to the
+/// field's location `(heap_object_ptr, object_relative_offset)` via the
+/// per-tag `offsets` table. A tag past the table is heap corruption (a
+/// well-formed enum's tag is always in range) and surfaces as an invariant
+/// violation; a `None` hole means the runtime variant does not declare the
+/// field, a user-level `EnumVariantMismatch` error.
+///
+/// # Safety
+///
+/// `fp + enum_ref` must hold a valid fat pointer to a live enum heap object.
+#[inline(always)]
+unsafe fn variant_field_loc(
+    fp: *mut u8,
+    enum_ref: FrameOffset,
+    offsets: &[Option<u32>],
+) -> VMResult<(*mut u8, u32)> {
+    // SAFETY: forwarded from this function's contract.
+    let (ref_base, ref_off) = unsafe { read_fat_ptr(fp, enum_ref) };
+    let obj_ptr = unsafe { read_ptr(ref_base, ref_off as usize) };
+    let tag = unsafe { read_enum_tag(obj_ptr) };
+    let Some(variant_offset) = offsets.get(tag as usize) else {
+        // A tag past the variant table is heap corruption (a well-formed
+        // enum's tag is always in range), not a user-level mismatch.
+        invariant_violation!(EnumTagOutOfRange {
+            tag,
+            variant_count: offsets.len(),
+        });
+    };
+    match variant_offset {
+        Some(offset) => Ok((obj_ptr, *offset)),
+        // Tag in range but this variant does not declare the field (move
+        // semantics for this is a runtime error).
+        None => Err(VMInternalError::new(RuntimeError::EnumVariantMismatch {
+            tag,
+        })),
+    }
+}
+
 // Dispatch on an [`IntOperand`]: for each variant, invoke the caller's
 // `$action!` macro with three arguments — `($rust_ty, $sign, $rhs_value)`.
 // `$sign` is the literal token `unsigned` or `signed`, letting `$action!`
@@ -581,14 +941,14 @@ macro_rules! impl_int_arith {
         /// `fp` is the current frame pointer; `op`'s slot offsets are
         /// in-bounds (enforced by the verifier).
         #[inline(never)]
-        unsafe fn $fn_name(fp: *mut u8, op: &IntBinaryOp) -> RuntimeResult<()> {
+        unsafe fn $fn_name(fp: *mut u8, op: &IntBinaryOp) -> VMResult<()> {
             unsafe {
                 macro_rules! exec {
                     ($ty: ty,$_sign: tt,$rhs: expr) => {{
                         let lhs_val: $ty = read_int::<$ty>(fp, op.lhs);
                         let rhs_val: $ty = $rhs;
                         let result: $ty = <$ty>::$method(lhs_val, rhs_val)
-                            .ok_or_else(|| RuntimeError::$variant $body)?;
+                            .ok_or_else(|| VMInternalError::new(RuntimeError::$variant $body))?;
                         write_int::<$ty>(fp, op.dst, result);
                     }};
                 }
@@ -643,7 +1003,7 @@ macro_rules! impl_int_bitwise {
         /// # Safety
         /// See [`exec_int_add`].
         #[inline(never)]
-        unsafe fn $fn_name(fp: *mut u8, op: &IntBinaryOp) -> RuntimeResult<()> {
+        unsafe fn $fn_name(fp: *mut u8, op: &IntBinaryOp) -> VMResult<()> {
             unsafe {
                 macro_rules! exec {
                     ($ty:ty, unsigned, $rhs:expr) => {{
@@ -713,7 +1073,7 @@ macro_rules! impl_int_shift {
         /// # Safety
         /// See [`exec_int_add`].
         #[inline(never)]
-        unsafe fn $fn_name(fp: *mut u8, op: &IntShiftOp) -> RuntimeResult<()> {
+        unsafe fn $fn_name(fp: *mut u8, op: &IntShiftOp) -> VMResult<()> {
             unsafe {
                 let shift_amount: u8 = match &op.rhs {
                     ShiftOperand::SlotU8(off) => read_u8(fp, *off),
@@ -721,12 +1081,12 @@ macro_rules! impl_int_shift {
                 };
                 let bit_width = op.ty.bit_width() as u32;
                 if (shift_amount as u32) >= bit_width {
-                    return Err(RuntimeError::ShiftAmountOutOfRange {
+                    return Err(VMInternalError::new(RuntimeError::ShiftAmountOutOfRange {
                         op: $base_op,
                         ty: op.ty,
                         shift_amount,
                         bit_width,
-                    });
+                    }));
                 }
                 macro_rules! exec {
                     ($ty:ty, unsigned, $shift_val:expr) => {{
@@ -754,13 +1114,14 @@ impl_int_shift!(exec_int_shr, ArithOp::Shr, >>);
 /// # Safety
 /// See [`exec_int_add`].
 #[inline(never)]
-unsafe fn exec_int_negate(fp: *mut u8, op: &IntNegateOp) -> RuntimeResult<()> {
+unsafe fn exec_int_negate(fp: *mut u8, op: &IntNegateOp) -> VMResult<()> {
     unsafe {
         macro_rules! exec {
             ($ty:ty) => {{
                 let src_val: $ty = read_int::<$ty>(fp, op.src);
-                let result: $ty = <$ty>::checked_neg(src_val)
-                    .ok_or_else(|| RuntimeError::NegateMinOverflow { ty: op.ty })?;
+                let result: $ty = <$ty>::checked_neg(src_val).ok_or_else(|| {
+                    VMInternalError::new(RuntimeError::NegateMinOverflow { ty: op.ty })
+                })?;
                 write_int::<$ty>(fp, op.dst, result);
             }};
         }
@@ -808,7 +1169,7 @@ macro_rules! dispatch_int_ty {
 ///
 /// Same as [`exec_int_add`].
 #[inline(never)]
-unsafe fn exec_int_cast(fp: *mut u8, op: &IntCastOp) -> RuntimeResult<()> {
+unsafe fn exec_int_cast(fp: *mut u8, op: &IntCastOp) -> VMResult<()> {
     unsafe {
         macro_rules! cast_from {
             ($src_ty:ty) => {{
@@ -862,7 +1223,7 @@ unsafe fn int_cmp_bool(fp: *mut u8, lhs: FrameOffset, op: CmpKind, rhs: &IntOper
 // Interpreter loop
 // ---------------------------------------------------------------------------
 
-impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterContext<'_, T> {
+impl InterpreterContext<'_> {
     /// Shared body of the conditional `Jump*` micro-ops: charge the chosen
     /// edge's cost, then jump to `target` or fall through to the next pc.
     #[inline(always)]
@@ -873,18 +1234,24 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
         gas_taken: u64,
         gas_fallthrough: u64,
         regs: &mut VMRegisters,
-    ) -> RuntimeResult<()> {
+    ) -> VMResult<()> {
         if cond {
-            self.exec_ctx.gas_meter().charge(gas_taken)?;
+            self.gas_meter.charge(gas_taken)?;
             regs.pc = target.into();
         } else {
-            self.exec_ctx.gas_meter().charge(gas_fallthrough)?;
+            self.gas_meter.charge(gas_fallthrough)?;
             regs.pc += 1;
         }
         Ok(())
     }
 
-    pub fn run(&mut self) -> RuntimeResult<RuntimeStatus> {
+    pub fn run(&mut self) -> VMResult<RuntimeStatus> {
+        if self.registers.is_idle() {
+            invariant_violation!(Unreachable(
+                "run on an idle context: no call was prepared".to_string()
+            ));
+        }
+
         // Hoist the VM registers into a local so the dispatch loop keeps
         // them in CPU registers rather than reloading from `self.registers`
         // each iteration. Only sync back to `self` on exit.
@@ -892,7 +1259,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
 
         // Charge the entry function's entry block before any of its instructions run.
         let entry_gas = unsafe { regs.func.as_ref() }.entry_gas;
-        self.exec_ctx.gas_meter().charge(entry_gas)?;
+        self.gas_meter.charge(entry_gas)?;
 
         let outcome = loop {
             // SAFETY: Current function is always a valid, non-null pointer because
@@ -900,7 +1267,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
             // executing a call instruction, which stores a valid pointer.
             let func = unsafe { regs.func.as_ref() };
 
-            let code = func.code.get();
+            let code = func.code.ops();
 
             if regs.pc >= code.len() {
                 invariant_violation!(PcOutOfBounds {
@@ -936,10 +1303,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         //   3. IC insert target
                         //   4. Patching:
                         //      If can patch caller, try it.
-                        let target = self
-                            .exec_ctx
-                            .load_function(module_id, func_name, ty_args)
-                            .map_err(RuntimeError::Loader)?;
+                        let target = self.load_function(module_id, func_name, ty_args)?;
                         // SAFETY: `target` points to a `Function`, which is not reclaimed during
                         // execution as guaranteed by the execution guard.
                         self.call(func, &mut regs, target.as_ref_unchecked())?;
@@ -960,7 +1324,21 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         if let Some((code, message)) =
                             self.exec_call_native(func, regs, native_idx, ty_args, abi)?
                         {
-                            break RuntimeStatus::Aborted { code, message };
+                            // Attribute the abort to the native's own module
+                            // (not the caller's, which `regs.func` names here)
+                            // — the same rule as a Move-level abort.
+                            let location = match self.natives.module_by_idx(native_idx) {
+                                Some(module_id) => abort_location(module_id)?,
+                                None => invariant_violation!(NativeIdxOutOfBounds {
+                                    idx: native_idx.0,
+                                    registry_size: self.natives.len(),
+                                }),
+                            };
+                            break RuntimeStatus::Aborted {
+                                code,
+                                message,
+                                location,
+                            };
                         }
                     },
 
@@ -1032,7 +1410,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         // vector slot holds a pointer read through to its heap data.
                         let a = fp.add(op.lhs.into());
                         let b = fp.add(op.rhs.into());
-                        let eq = value_utils::equals(self.exec_ctx, a, b, op.ty)?;
+                        let eq = value_utils::equals(self.loader.guard(), a, b, op.ty)?;
                         self.cond_branch(
                             eq ^ op.negate,
                             op.target,
@@ -1049,7 +1427,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         let (lb, lo) = read_fat_ptr(fp, op.lhs);
                         let (rb, ro) = read_fat_ptr(fp, op.rhs);
                         let eq = value_utils::equals(
-                            self.exec_ctx,
+                            self.loader.guard(),
                             lb.add(lo as usize),
                             rb.add(ro as usize),
                             op.ty,
@@ -1184,7 +1562,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                     },
 
                     MicroOp::Jump { target, gas } => {
-                        self.exec_ctx.gas_meter().charge(gas)?;
+                        self.gas_meter.charge(gas)?;
                         regs.pc = target.into();
                         continue;
                     },
@@ -1211,6 +1589,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         break RuntimeStatus::Aborted {
                             code,
                             message: None,
+                            location: abort_location(func.module_id)?,
                         };
                     },
 
@@ -1223,10 +1602,12 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         } else {
                             // TODO(metering): charge gas for abort message bytes.
                             if len > ABORT_MESSAGE_SIZE_LIMIT {
-                                return Err(RuntimeError::AbortMessageTooLong {
-                                    len,
-                                    max: ABORT_MESSAGE_SIZE_LIMIT,
-                                });
+                                return Err(VMInternalError::new(
+                                    RuntimeError::AbortMessageTooLong {
+                                        len,
+                                        max: ABORT_MESSAGE_SIZE_LIMIT,
+                                    },
+                                ));
                             }
                             // SAFETY: `vec_ptr` is non-null for non-zero lengths
                             // and points at a heap vector with `len` initialized
@@ -1238,6 +1619,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         break RuntimeStatus::Aborted {
                             code,
                             message: Some(message),
+                            location: abort_location(func.module_id)?,
                         };
                     },
 
@@ -1254,16 +1636,16 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
 
                     // Add
                     MicroOp::AddU64 { dst, lhs, rhs } => {
-                        checked_binop_u64(fp, dst, lhs, rhs, u64::checked_add).ok_or_else(|| {
+                        checked_binop_u64(fp, dst, lhs, rhs, u64::checked_add).ok_or(
                             RuntimeError::ArithmeticOverflow {
                                 op: ArithOp::Add,
                                 ty: IntTy::U64,
-                            }
-                        })?
+                            },
+                        )?
                     },
                     MicroOp::AddU64Imm { dst, src, imm } => {
-                        checked_imm_op_u64(fp, dst, src, imm, u64::checked_add).ok_or_else(
-                            || RuntimeError::ArithmeticOverflow {
+                        checked_imm_op_u64(fp, dst, src, imm, u64::checked_add).ok_or(
+                            RuntimeError::ArithmeticOverflow {
                                 op: ArithOp::Add,
                                 ty: IntTy::U64,
                             },
@@ -1272,16 +1654,16 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
 
                     // Sub
                     MicroOp::SubU64 { dst, lhs, rhs } => {
-                        checked_binop_u64(fp, dst, lhs, rhs, u64::checked_sub).ok_or_else(|| {
+                        checked_binop_u64(fp, dst, lhs, rhs, u64::checked_sub).ok_or(
                             RuntimeError::ArithmeticUnderflow {
                                 op: ArithOp::Sub,
                                 ty: IntTy::U64,
-                            }
-                        })?
+                            },
+                        )?
                     },
                     MicroOp::SubU64Imm { dst, src, imm } => {
-                        checked_imm_op_u64(fp, dst, src, imm, u64::checked_sub).ok_or_else(
-                            || RuntimeError::ArithmeticUnderflow {
+                        checked_imm_op_u64(fp, dst, src, imm, u64::checked_sub).ok_or(
+                            RuntimeError::ArithmeticUnderflow {
                                 op: ArithOp::Sub,
                                 ty: IntTy::U64,
                             },
@@ -1290,24 +1672,26 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                     // dst = imm - src, so flip the operand order.
                     MicroOp::RSubU64Imm { dst, src, imm } => {
                         checked_imm_op_u64(fp, dst, src, imm, |s, i| u64::checked_sub(i, s))
-                            .ok_or_else(|| RuntimeError::ArithmeticUnderflow {
-                                op: ArithOp::Sub,
-                                ty: IntTy::U64,
+                            .ok_or_else(|| {
+                                VMInternalError::new(RuntimeError::ArithmeticUnderflow {
+                                    op: ArithOp::Sub,
+                                    ty: IntTy::U64,
+                                })
                             })?
                     },
 
                     // Mul
                     MicroOp::MulU64 { dst, lhs, rhs } => {
-                        checked_binop_u64(fp, dst, lhs, rhs, u64::checked_mul).ok_or_else(|| {
+                        checked_binop_u64(fp, dst, lhs, rhs, u64::checked_mul).ok_or(
                             RuntimeError::ArithmeticOverflow {
                                 op: ArithOp::Mul,
                                 ty: IntTy::U64,
-                            }
-                        })?
+                            },
+                        )?
                     },
                     MicroOp::MulU64Imm { dst, src, imm } => {
-                        checked_imm_op_u64(fp, dst, src, imm, u64::checked_mul).ok_or_else(
-                            || RuntimeError::ArithmeticOverflow {
+                        checked_imm_op_u64(fp, dst, src, imm, u64::checked_mul).ok_or(
+                            RuntimeError::ArithmeticOverflow {
                                 op: ArithOp::Mul,
                                 ty: IntTy::U64,
                             },
@@ -1316,12 +1700,12 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
 
                     // Div / Mod
                     MicroOp::DivU64 { dst, lhs, rhs } => {
-                        checked_binop_u64(fp, dst, lhs, rhs, u64::checked_div).ok_or_else(|| {
+                        checked_binop_u64(fp, dst, lhs, rhs, u64::checked_div).ok_or(
                             RuntimeError::DivisionByZero {
                                 op: ArithOp::Div,
                                 ty: IntTy::U64,
-                            }
-                        })?
+                            },
+                        )?
                     },
                     // INVARIANT: the verifier rejects `imm == 0`, so plain `s / imm`
                     // cannot trigger Rust's div-by-zero panic. Asserted below in
@@ -1334,12 +1718,12 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         imm_op_u64(fp, dst, src, imm, |s, i| s / i)
                     },
                     MicroOp::ModU64 { dst, lhs, rhs } => {
-                        checked_binop_u64(fp, dst, lhs, rhs, u64::checked_rem).ok_or_else(|| {
+                        checked_binop_u64(fp, dst, lhs, rhs, u64::checked_rem).ok_or(
                             RuntimeError::DivisionByZero {
                                 op: ArithOp::Mod,
                                 ty: IntTy::U64,
-                            }
-                        })?
+                            },
+                        )?
                     },
                     // INVARIANT: the verifier rejects `imm == 0`, so plain `s % imm`
                     // cannot trigger Rust's div-by-zero panic. Asserted below in
@@ -1407,8 +1791,11 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                     },
 
                     MicroOp::Move8 { dst, src } => {
-                        let v = read_u64(fp, src);
-                        write_u64(fp, dst, v);
+                        // The slots need not be 8-aligned (see `Move8`'s doc),
+                        // so the accesses must be unaligned — same codegen as
+                        // aligned loads on x86-64/aarch64.
+                        let v = (fp.add(src.into()) as *const u64).read_unaligned();
+                        (fp.add(dst.into()) as *mut u64).write_unaligned(v);
                     },
 
                     MicroOp::Move { dst, src, size } => {
@@ -1488,7 +1875,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         let vec_ptr = read_ptr(ref_base, ref_off as usize);
                         let len = read_vec_len(vec_ptr);
                         if len == 0 {
-                            return Err(RuntimeError::PopFromEmptyVector);
+                            return Err(VMInternalError::new(RuntimeError::PopFromEmptyVector));
                         }
                         let new_len = len - 1;
                         std::ptr::copy_nonoverlapping(
@@ -1510,11 +1897,13 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         let idx = read_u64(fp, idx);
                         let len = read_vec_len(vec_ptr);
                         if idx >= len {
-                            return Err(RuntimeError::VectorIndexOutOfBounds {
-                                op: VecOp::LoadElem,
-                                idx,
-                                len,
-                            });
+                            return Err(VMInternalError::new(
+                                RuntimeError::VectorIndexOutOfBounds {
+                                    op: VecOp::LoadElem,
+                                    idx,
+                                    len,
+                                },
+                            ));
                         }
                         std::ptr::copy_nonoverlapping(
                             vec_elem_ptr(vec_ptr, idx, elem_size),
@@ -1534,11 +1923,13 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         let idx = read_u64(fp, idx);
                         let len = read_vec_len(vec_ptr);
                         if idx >= len {
-                            return Err(RuntimeError::VectorIndexOutOfBounds {
-                                op: VecOp::StoreElem,
-                                idx,
-                                len,
-                            });
+                            return Err(VMInternalError::new(
+                                RuntimeError::VectorIndexOutOfBounds {
+                                    op: VecOp::StoreElem,
+                                    idx,
+                                    len,
+                                },
+                            ));
                         }
                         std::ptr::copy_nonoverlapping(
                             fp.add(src.into()),
@@ -1569,11 +1960,13 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         // Indices are checked before the equal-indices no-op.
                         for idx in [idx_a, idx_b] {
                             if idx >= len {
-                                return Err(RuntimeError::VectorIndexOutOfBounds {
-                                    op: VecOp::Swap,
-                                    idx,
-                                    len,
-                                });
+                                return Err(VMInternalError::new(
+                                    RuntimeError::VectorIndexOutOfBounds {
+                                        op: VecOp::Swap,
+                                        idx,
+                                        len,
+                                    },
+                                ));
                             }
                         }
                         // Equal pointers are UB for `swap_nonoverlapping`; distinct
@@ -1599,11 +1992,13 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         let idx = read_u64(fp, idx);
                         let len = read_vec_len(vec_ptr);
                         if idx >= len {
-                            return Err(RuntimeError::VectorIndexOutOfBounds {
-                                op: VecOp::Borrow,
-                                idx,
-                                len,
-                            });
+                            return Err(VMInternalError::new(
+                                RuntimeError::VectorIndexOutOfBounds {
+                                    op: VecOp::Borrow,
+                                    idx,
+                                    len,
+                                },
+                            ));
                         }
                         let offset = VEC_DATA_OFFSET as u64 + idx * elem_size as u64;
                         write_fat_ptr(fp, dst, vec_ptr, offset);
@@ -1672,8 +2067,12 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         offset,
                     } => {
                         let obj_ptr = read_ptr(fp, heap_ptr);
-                        let val = read_u64(obj_ptr, offset as usize);
-                        write_u64(fp, dst, val);
+                        // Neither `heap_ptr + offset` nor the frame slot need
+                        // be 8-aligned (see the op's doc), so the accesses
+                        // must be unaligned — same codegen as aligned loads
+                        // on x86-64/aarch64.
+                        let val = (obj_ptr.add(offset as usize) as *const u64).read_unaligned();
+                        (fp.add(dst.into()) as *mut u64).write_unaligned(val);
                     },
 
                     MicroOp::HeapMoveFrom {
@@ -1696,8 +2095,9 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         src,
                     } => {
                         let obj_ptr = read_ptr(fp, heap_ptr);
-                        let val = read_u64(fp, src);
-                        write_u64(obj_ptr, offset as usize, val);
+                        // Unaligned accesses: see `HeapMoveFrom8` above.
+                        let val = (fp.add(src.into()) as *const u64).read_unaligned();
+                        (obj_ptr.add(offset as usize) as *mut u64).write_unaligned(val);
                     },
 
                     MicroOp::HeapMoveToImm8 {
@@ -1706,7 +2106,8 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         imm,
                     } => {
                         let obj_ptr = read_ptr(fp, heap_ptr);
-                        write_u64(obj_ptr, offset as usize, imm);
+                        // Unaligned access: see `HeapMoveFrom8` above.
+                        (obj_ptr.add(offset as usize) as *mut u64).write_unaligned(imm);
                     },
 
                     MicroOp::HeapMoveTo {
@@ -1759,18 +2160,22 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
 
                     MicroOp::Exists { addr, ty, dst } => {
                         let address = read_account_address(fp, addr);
+                        let group = self.resource_group_of(ty)?;
                         let exists = self.read_write_set.exists(
-                            self.exec_ctx.resource_provider(),
+                            self.resource_provider,
                             &InMemoryStorageKey::resource(address, ty),
+                            group,
                         )?;
                         write_bool(fp, dst, exists);
                     },
 
                     MicroOp::BorrowGlobal { addr, ty, dst } => {
                         let address = read_account_address(fp, addr);
+                        let group = self.resource_group_of(ty)?;
                         let ptr = self.read_write_set.borrow_global(
-                            self.exec_ctx.resource_provider(),
+                            self.resource_provider,
                             &InMemoryStorageKey::resource(address, ty),
+                            group,
                         )?;
                         // A reference is a 16-byte fat pointer; the borrow points
                         // at the start of the resource, so the offset half is 0.
@@ -1779,11 +2184,13 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
 
                     MicroOp::BorrowGlobalMut { addr, ty, dst } => {
                         let address = read_account_address(fp, addr);
+                        let group = self.resource_group_of(ty)?;
                         let key = InMemoryStorageKey::resource(address, ty);
-                        let ptr = match self
-                            .read_write_set
-                            .try_borrow_global_mut(self.exec_ctx.resource_provider(), &key)?
-                        {
+                        let ptr = match self.read_write_set.try_borrow_global_mut(
+                            self.resource_provider,
+                            &key,
+                            group,
+                        )? {
                             EntryPtr::Writable(ptr) => ptr,
                             EntryPtr::NonWritable(ptr) => {
                                 let ptr = self.deep_copy(regs, ptr)?;
@@ -1798,10 +2205,13 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
 
                     MicroOp::MoveFrom { addr, ty, dst } => {
                         let address = read_account_address(fp, addr);
+                        let group = self.resource_group_of(ty)?;
                         let key = InMemoryStorageKey::resource(address, ty);
-                        let entry_ptr = self
-                            .read_write_set
-                            .try_move_from(self.exec_ctx.resource_provider(), &key)?;
+                        let entry_ptr = self.read_write_set.try_move_from(
+                            self.resource_provider,
+                            &key,
+                            group,
+                        )?;
                         let ptr = match entry_ptr {
                             EntryPtr::Writable(ptr) => ptr,
                             EntryPtr::NonWritable(ptr) => {
@@ -1824,10 +2234,12 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         let Some(ptr) = NonNull::new(read_ptr(fp, src)) else {
                             invariant_violation!(MoveToNullSource);
                         };
+                        let group = self.resource_group_of(ty)?;
 
                         self.read_write_set.move_to(
-                            self.exec_ctx.resource_provider(),
+                            self.resource_provider,
                             &InMemoryStorageKey::resource(address, ty),
+                            group,
                             ptr,
                         )?;
                     },
@@ -1840,7 +2252,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         // vector slot holds a pointer read through to its heap data.
                         let a = fp.add(op.lhs.into());
                         let b = fp.add(op.rhs.into());
-                        let eq = value_utils::equals(&*self.exec_ctx, a, b, op.ty)?;
+                        let eq = value_utils::equals(self.loader.guard(), a, b, op.ty)?;
                         write_bool(fp, op.dst, eq ^ op.negate);
                     },
                     MicroOp::ValueRefCmp(ref op) => {
@@ -1849,7 +2261,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         let (lb, lo) = read_fat_ptr(fp, op.lhs);
                         let (rb, ro) = read_fat_ptr(fp, op.rhs);
                         let eq = value_utils::equals(
-                            &*self.exec_ctx,
+                            self.loader.guard(),
                             lb.add(lo as usize),
                             rb.add(ro as usize),
                             op.ty,
@@ -1879,32 +2291,15 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         write_bool(fp, dst, tag == variant);
                     },
 
-                    MicroOp::EnumBorrowVariantField {
+                    MicroOp::EnumBorrowVariantFieldByTag {
                         dst,
                         enum_ref,
                         ref offsets,
                     } => {
-                        // Deref the enum fat pointer to the heap object, read the
-                        // tag, then borrow the field at that variant's offset.
-                        let (ref_base, ref_off) = read_fat_ptr(fp, enum_ref);
-                        let obj_ptr = read_ptr(ref_base, ref_off as usize);
-                        let tag = read_enum_tag(obj_ptr);
-                        let Some(variant_offset) = offsets.get(tag as usize) else {
-                            // A tag past the variant table is heap corruption (a
-                            // well-formed enum's tag is always in range), not a
-                            // user-level mismatch. Surface it as an invariant
-                            // violation.
-                            invariant_violation!(EnumTagOutOfRange {
-                                tag,
-                                variant_count: offsets.len(),
-                            });
-                        };
-                        match variant_offset {
-                            Some(offset) => write_fat_ptr(fp, dst, obj_ptr, *offset as u64),
-                            // Tag in range but this variant does not declare the
-                            // field (move semantics for this is a runtime error).
-                            None => return Err(RuntimeError::EnumVariantMismatch { tag }),
-                        }
+                        // The field reference written to `dst` is a fat pointer
+                        // pairing the heap object with the tag-selected offset.
+                        let (obj_ptr, offset) = variant_field_loc(fp, enum_ref, offsets)?;
+                        write_fat_ptr(fp, dst, obj_ptr, offset as u64);
                     },
 
                     MicroOp::EnumCheckVariant { enum_ptr, variant } => {
@@ -1913,7 +2308,9 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         let obj_ptr = read_ptr(fp, enum_ptr);
                         let tag = read_enum_tag(obj_ptr);
                         if tag != variant {
-                            return Err(RuntimeError::EnumVariantMismatch { tag });
+                            return Err(VMInternalError::new(RuntimeError::EnumVariantMismatch {
+                                tag,
+                            }));
                         }
                     },
 
@@ -1930,20 +2327,19 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         write_ptr(fp, dst, obj_ptr);
                     },
 
-                    MicroOp::EnumReadVariantField {
+                    MicroOp::HeapReadOffset {
                         dst,
-                        enum_ref,
+                        obj_ref,
                         offset,
                         size,
                     } => {
-                        // Double deref of the enum fat pointer to the heap object,
-                        // then copy the field bytes directly — no intermediate
-                        // scratch reference. The offset is a static uniform offset
-                        // (no tag dispatch).
-                        let (ref_base, ref_off) = read_fat_ptr(fp, enum_ref);
+                        // Deref the fat pointer to the heap object, then copy
+                        // the bytes at the static offset directly (no tag
+                        // dispatch).
+                        let (ref_base, ref_off) = read_fat_ptr(fp, obj_ref);
                         let obj_ptr = read_ptr(ref_base, ref_off as usize);
-                        // Non-overlapping: `dst` is a stack-region slot, the field
-                        // is heap-object bytes.
+                        // Non-overlapping: `dst` is a stack-region slot, the
+                        // source is heap-object bytes.
                         std::ptr::copy_nonoverlapping(
                             obj_ptr.add(offset as usize),
                             fp.add(dst.into()),
@@ -1951,16 +2347,48 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                         );
                     },
 
-                    MicroOp::EnumWriteVariantField {
-                        enum_ref,
+                    MicroOp::HeapWriteOffset {
+                        obj_ref,
                         offset,
                         src,
                         size,
                     } => {
-                        let (ref_base, ref_off) = read_fat_ptr(fp, enum_ref);
+                        let (ref_base, ref_off) = read_fat_ptr(fp, obj_ref);
                         let obj_ptr = read_ptr(ref_base, ref_off as usize);
-                        // Non-overlapping: `src` is a stack-region slot, the field
-                        // is heap-object bytes.
+                        // Non-overlapping: `src` is a stack-region slot, the
+                        // destination is heap-object bytes.
+                        std::ptr::copy_nonoverlapping(
+                            fp.add(src.into()),
+                            obj_ptr.add(offset as usize),
+                            size as usize,
+                        );
+                    },
+
+                    MicroOp::EnumReadVariantFieldByTag {
+                        dst,
+                        enum_ref,
+                        ref offsets,
+                        size,
+                    } => {
+                        let (obj_ptr, offset) = variant_field_loc(fp, enum_ref, offsets)?;
+                        // Non-overlapping: `dst` is a stack-region slot, the
+                        // field is heap-object bytes.
+                        std::ptr::copy_nonoverlapping(
+                            obj_ptr.add(offset as usize),
+                            fp.add(dst.into()),
+                            size as usize,
+                        );
+                    },
+
+                    MicroOp::EnumWriteVariantFieldByTag {
+                        enum_ref,
+                        ref offsets,
+                        src,
+                        size,
+                    } => {
+                        let (obj_ptr, offset) = variant_field_loc(fp, enum_ref, offsets)?;
+                        // Non-overlapping: `src` is a stack-region slot, the
+                        // field is heap-object bytes.
                         std::ptr::copy_nonoverlapping(
                             fp.add(src.into()),
                             obj_ptr.add(offset as usize),
@@ -2030,25 +2458,25 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
         regs: VMRegisters,
         dst: FrameOffset,
         idx: ConstantPoolIndex,
-    ) -> RuntimeResult<()> {
+    ) -> VMResult<()> {
         // SAFETY: `regs.func` points to the live, currently-executing function.
         let module_id = unsafe { regs.func.as_ref() }.module_id;
-        let (ty, bytes) = self.exec_ctx.load_constant(module_id, idx)?;
+        let (ty, bytes) = self.load_constant(module_id, idx)?;
 
         // SAFETY: `dst` is a verified 8-byte frame slot for a vector pointer
         // and is writable (no aliasing to the heap).
         unsafe {
             let dst = regs.fp.add(usize::from(dst));
             deserialize_or_gc(
-                self.exec_ctx,
+                self.loader.guard(),
                 &mut self.heap,
                 ty,
                 bytes,
                 dst,
-                self.exec_ctx,
+                self.loader.guard(),
                 &mut self.read_write_set,
                 &self.root_pool,
-                self.exec_ctx.extensions(),
+                &self.extensions,
                 regs.fp,
                 crate::heap::TopFrame::Function {
                     func: regs.func,
@@ -2070,7 +2498,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
     // Outlined to keep the dispatch loop small: an inlined body here adds to
     // the register pressure that competes for `fp`'s register across the loop.
     #[inline(never)]
-    unsafe fn exec_vec_pack(&mut self, regs: VMRegisters, op: &VecPackOp) -> RuntimeResult<()> {
+    unsafe fn exec_vec_pack(&mut self, regs: VMRegisters, op: &VecPackOp) -> VMResult<()> {
         let fp = regs.fp;
         let count = op.srcs.len() as u64;
         // TODO(perf): `alloc_vec!` zero-fills the whole allocation, but every
@@ -2112,13 +2540,15 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
     ///
     /// - `fp` is the current frame pointer.
     /// - `op.src` and each `op.dsts` slot are in-bounds for the current frame.
-    unsafe fn exec_vec_unpack(&mut self, fp: *mut u8, op: &VecUnpackOp) -> RuntimeResult<()> {
+    unsafe fn exec_vec_unpack(&mut self, fp: *mut u8, op: &VecUnpackOp) -> VMResult<()> {
         unsafe {
             let vec_ptr = read_ptr(fp, op.src);
             let expected = op.dsts.len() as u64;
             let actual = read_vec_len(vec_ptr);
             if actual != expected {
-                return Err(RuntimeError::VecUnpackLengthMismatch { expected, actual });
+                return Err(VMInternalError::new(
+                    RuntimeError::VecUnpackLengthMismatch { expected, actual },
+                ));
             }
             for (elem_idx, dst) in op.dsts.iter().enumerate() {
                 // Non-overlapping: the source is a heap vector element, the
@@ -2141,19 +2571,15 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
     ///
     /// Source must point to the data region of a live object whose header is
     /// at `src - OBJECT_HEADER_SIZE`.
-    unsafe fn deep_copy(
-        &mut self,
-        regs: VMRegisters,
-        root: NonNull<u8>,
-    ) -> RuntimeResult<NonNull<u8>> {
+    unsafe fn deep_copy(&mut self, regs: VMRegisters, root: NonNull<u8>) -> VMResult<NonNull<u8>> {
         // SAFETY: by this function's contract `root` points to a live object.
         unsafe {
             deep_copy_or_gc(
                 &mut self.heap,
-                self.exec_ctx,
+                self.loader.guard(),
                 &mut self.read_write_set,
                 &self.root_pool,
-                self.exec_ctx.extensions(),
+                &self.extensions,
                 regs.fp,
                 TopFrame::Function {
                     func: regs.func,
@@ -2183,7 +2609,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
         &mut self,
         regs: VMRegisters,
         sources: &[NonNull<u8>],
-    ) -> RuntimeResult<Vec<NonNull<u8>>> {
+    ) -> VMResult<Vec<NonNull<u8>>> {
         // SAFETY: each source is a live object (caller contract); the handle
         // keeps it live and relocated across any GC during the batch.
         let guards: Vec<ObjectHandle> = sources
@@ -2200,10 +2626,10 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
             // valid and relocated.
             match unsafe {
                 self.heap
-                    .try_deep_copy(self.exec_ctx, NonNull::new_unchecked(guard.ptr()))
+                    .try_deep_copy(self.loader.guard(), NonNull::new_unchecked(guard.ptr()))
             } {
                 Ok(ptr) => out.push(ptr),
-                Err(AllocationError::RuntimeError(err)) => return Err(err),
+                Err(AllocationError::RuntimeError(err)) => return Err(VMInternalError::new(err)),
                 Err(AllocationError::OutOfHeapMemory { .. }) => {
                     needs_gc = true;
                     break;
@@ -2219,7 +2645,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
             // SAFETY: as above, after relocation.
             let ptr = unsafe {
                 self.heap
-                    .try_deep_copy(self.exec_ctx, NonNull::new_unchecked(guard.ptr()))
+                    .try_deep_copy(self.loader.guard(), NonNull::new_unchecked(guard.ptr()))
             }
             .map_err(AllocationError::into_runtime_error)?;
             out.push(ptr);
@@ -2260,11 +2686,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
     ///   `pointer_offsets`, so GC traces the captured-data pointer after
     ///   the closure is reachable via the frame slot.
     #[inline(never)]
-    unsafe fn exec_pack_closure(
-        &mut self,
-        regs: VMRegisters,
-        op: &PackClosureOp,
-    ) -> RuntimeResult<()> {
+    unsafe fn exec_pack_closure(&mut self, regs: VMRegisters, op: &PackClosureOp) -> VMResult<()> {
         let fp = regs.fp;
         unsafe {
             // Fast path: non-capturing closure. Skip the second allocation
@@ -2402,7 +2824,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
         func: &Function,
         mut regs: VMRegisters,
         op: &CallClosureOp,
-    ) -> RuntimeResult<VMRegisters> {
+    ) -> VMResult<VMRegisters> {
         let fp = regs.fp;
         unsafe {
             let closure = read_ptr(fp, op.closure_src);
@@ -2427,10 +2849,11 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
                 FUNC_REF_TAG_RESOLVED => (&*(payload as *const Function), false),
                 FUNC_REF_TAG_UNRESOLVED => {
                     let func_ref = &*(payload as *const FunctionRef);
-                    let func_ptr = self
-                        .exec_ctx
-                        .load_function(func_ref.module_id, func_ref.func_name, func_ref.ty_args)
-                        .map_err(RuntimeError::Loader)?;
+                    let func_ptr = self.load_function(
+                        func_ref.module_id,
+                        func_ref.func_name,
+                        func_ref.ty_args,
+                    )?;
                     (func_ptr.as_ref_unchecked(), true)
                 },
                 other => invariant_violation!(InvalidClosureFuncRefTag { tag: other }),
@@ -2606,12 +3029,12 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
         caller: &Function,
         fp: *mut u8,
         callee_extended_frame_size: usize,
-    ) -> RuntimeResult<*mut u8> {
+    ) -> VMResult<*mut u8> {
         unsafe {
             let new_fp = fp.add(caller.param_and_local_sizes_sum + FRAME_METADATA_SIZE);
             let stack_end = self.stack.as_ptr().add(self.stack.len());
             if new_fp.add(callee_extended_frame_size) > stack_end {
-                return Err(RuntimeError::StackOverflow);
+                return Err(VMInternalError::new(RuntimeError::StackOverflow));
             }
             Ok(new_fp)
         }
@@ -2631,7 +3054,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
         caller: &Function,
         regs: &mut VMRegisters,
         callee: &Function,
-    ) -> RuntimeResult<()> {
+    ) -> VMResult<()> {
         let new_fp =
             unsafe { self.check_stack_for_call(caller, regs.fp, callee.extended_frame_size)? };
         unsafe { self.call_unchecked(caller, regs, callee, new_fp) }
@@ -2656,9 +3079,9 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
         regs: &mut VMRegisters,
         callee: &Function,
         new_fp: *mut u8,
-    ) -> RuntimeResult<()> {
+    ) -> VMResult<()> {
         // Charge the callee's entry block before any of its instructions run.
-        self.exec_ctx.gas_meter().charge(callee.entry_gas)?;
+        self.gas_meter.charge(callee.entry_gas)?;
         unsafe {
             // Zero everything beyond parameters (locals, metadata, callee
             // arg/return region) so pointer slots start as null.
@@ -2714,7 +3137,7 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
         native_idx: NativeIdx,
         ty_args: InternedTypeList,
         abi: &NativeABI,
-    ) -> RuntimeResult<Option<(u64, Option<String>)>> {
+    ) -> VMResult<Option<(u64, Option<String>)>> {
         // Check if we have enough space on the stack to allocate the native's frame.
         let new_fp =
             unsafe { self.check_stack_for_call(caller, regs.fp, abi.total_frame_size() as usize)? };
@@ -2740,12 +3163,10 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
         let saved_fp = regs.fp;
         self.registers.fp = new_fp;
         let result = {
-            let (registry, provider, layouts, resource_provider, gas_meter, extensions) =
-                self.exec_ctx.native_call_borrows();
-            let func = registry.lookup_by_idx(native_idx).ok_or_else(|| {
+            let func = self.natives.lookup_by_idx(native_idx).ok_or_else(|| {
                 RuntimeError::InvariantViolation(RuntimeInvariantViolation::NativeIdxOutOfBounds {
                     idx: native_idx.0,
-                    registry_size: registry.len(),
+                    registry_size: self.natives.len(),
                 })
             })?;
             // TODO(cleanup): eventually pass the interpreter context itself rather than
@@ -2754,26 +3175,28 @@ impl<T: ExecutionContext + DescriptorProvider + LayoutProvider> InterpreterConte
             // whether that's sound under the context's interior-mutability model
             // — clearer once everything (rws → table natives, gas → all) is
             // wired up.
+            let guard = self.loader.guard();
+            let resolve_resource_group = |ty| resolve_resource_group!(self, ty);
             let ctx = ProductionNativeContext::new(
                 new_fp,
                 abi,
                 view_type_list(ty_args),
-                gas_meter,
-                provider,
-                layouts,
-                resource_provider,
+                &mut self.gas_meter,
+                guard,
+                guard,
+                self.resource_provider,
+                &resolve_resource_group,
                 &mut self.heap,
                 &mut self.read_write_set,
-                extensions,
+                &self.extensions,
             );
             func(&ctx)
         };
         self.registers.fp = saved_fp;
 
-        match result {
-            Ok(NativeStatus::Success) => Ok(None),
-            Ok(NativeStatus::Abort { code, message }) => Ok(Some((code, message))),
-            Err(e) => Err(e.into_runtime_error()),
-        }
+        result.map(|status| match status {
+            NativeStatus::Success => None,
+            NativeStatus::Abort { code, message } => Some((code, message)),
+        })
     }
 }

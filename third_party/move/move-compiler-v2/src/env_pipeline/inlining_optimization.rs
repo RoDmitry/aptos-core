@@ -13,9 +13,8 @@ use crate::{
 use codespan_reporting::diagnostic::Severity;
 use move_binary_format::file_format::Visibility;
 use move_model::{
-    ast::{AccessSpecifierKind, Exp, ExpData, Operation, Pattern, TempIndex},
+    ast::{Exp, ExpData, Operation, Pattern, TempIndex},
     exp_rewriter::ExpRewriterFunctions,
-    metadata::LanguageVersion,
     model::{
         FunId, FunctionEnv, FunctionSize, GlobalEnv, Loc, ModuleEnv, ModuleId, NodeId, Parameter,
         QualifiedId,
@@ -216,7 +215,7 @@ fn find_cycles_in_call_graph(
     for scc in kosaraju_scc(&graph) {
         if scc.len() > 1 {
             // cycle involving non-self-recursion
-            cycle_nodes.extend(scc.into_iter());
+            cycle_nodes.extend(scc);
         }
     }
     cycle_nodes
@@ -251,7 +250,6 @@ fn compute_call_sites_to_inline_and_new_function_size(
                 || has_invisible_calls(caller_module, &callee_env, across_package)
                 || has_module_lock_attribute(&callee_env)
                 || has_cross_module_event_emit(caller_mid, &callee_env)
-                || has_access_controls(&callee_env)
             {
                 // won't inline if:
                 // - callee is inline (should have been inlined already)
@@ -359,7 +357,7 @@ fn pick_from_eligible_and_compute_cost(
             locals_budget_remaining.checked_sub(callee_info.locals_per_site),
             code_size_budget_remaining.checked_sub(callee_info.code_size * sites.len()),
         ) {
-            call_sites_to_inline.extend(sites.into_iter());
+            call_sites_to_inline.extend(sites);
             // Note that we reduce the remaining budget for number of locals once for
             // all the callsites of a callee, because we expect to coalesce the locals at
             // different callsites.
@@ -553,24 +551,6 @@ fn has_abort(function: &FunctionEnv, caller: &FunctionEnv) -> bool {
         !found
     });
     found
-}
-
-/// Does `function` have any runtime access control checks?
-/// If so, by inlining, such checks would not be performed.
-fn has_access_controls(function: &FunctionEnv) -> bool {
-    if let Some(access_specifiers) = function.get_access_specifiers() {
-        if access_specifiers.is_empty() {
-            // empty access specifiers means no access is allowed, the strictest form
-            // of access control
-            return true;
-        }
-        // any reads or writes specification is considered an access control
-        access_specifiers
-            .iter()
-            .any(|spec| spec.kind != AccessSpecifierKind::LegacyAcquires)
-    } else {
-        false
-    }
 }
 
 /// Does `function` have the `#[module_lock]` attribute?
@@ -783,13 +763,7 @@ impl CalleeRewriter<'_> {
                     .function_env
                     .env()
                     .new_node(loc.clone(), ty.instantiate(self.type_args));
-                if self
-                    .function_env
-                    .env()
-                    .language_version()
-                    .is_at_least(LanguageVersion::V2_1)
-                    && self.function_env.symbol_pool().string(*sym).as_ref() == "_"
-                {
+                if self.function_env.symbol_pool().string(*sym).as_ref() == "_" {
                     Pattern::Wildcard(id)
                 } else {
                     Pattern::Var(id, *sym)

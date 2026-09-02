@@ -671,14 +671,15 @@ module std::features {
         true
     }
 
-    const PERMISSIONED_SIGNER: u64 = 84;
 
+    #[deprecated]
     public fun get_permissioned_signer_feature(): u64 {
-        PERMISSIONED_SIGNER
+        abort error::invalid_argument(EINVALID_FEATURE)
     }
 
+    #[deprecated]
     public fun is_permissioned_signer_enabled(): bool {
-        is_enabled(PERMISSIONED_SIGNER)
+        false
     }
 
     /// Whether the account abstraction is enabled.
@@ -846,6 +847,18 @@ module std::features {
         is_enabled(ENCRYPTED_TRANSACTIONS)
     }
 
+    /// Whether multisig script payloads are enabled. Allows multisig accounts to
+    /// propose and execute Move script payloads, not just entry functions.
+    const MULTISIG_SCRIPT: u64 = 110;
+
+    public fun get_multisig_script_feature(): u64 {
+        MULTISIG_SCRIPT
+    }
+
+    public fun is_multisig_script_enabled(): bool {
+        is_enabled(MULTISIG_SCRIPT)
+    }
+
     /// Whether the transaction limits feature is enabled. Allows transactions
     /// to request higher execution/IO gas limits backed by staking voting power.
     const TRANSACTION_LIMITS: u64 = 111;
@@ -947,6 +960,41 @@ module std::features {
     /// Lifetime: permanent
     const HOT_STATE_ROOT_IN_TXN_INFO: u64 = 123;
 
+    /// When enabled, the gas refund in the epilogue mints APT directly as a fungible asset
+    /// via the paired `MintRef` (stored in `transaction_fee::AptosFAMintCapabilities`), instead
+    /// of minting a coin and converting it. This avoids touching the legacy coin supply
+    /// aggregator (v1), reducing Block-STM contention on refund transactions.
+    /// Lifetime: transient
+    const GAS_REFUND_FA_MINT: u64 = 124;
+
+    public fun gas_refund_fa_mint_enabled(): bool {
+        is_enabled(GAS_REFUND_FA_MINT)
+    }
+
+    /// Whether `FunctionInfo`-based dispatch (dispatchable fungible assets and account
+    /// abstraction) runs via function values from `std::reflect` instead of the legacy
+    /// native dispatch machinery. Requires `FUNCTION_REFLECTION`.
+    /// Lifetime: transient
+    const FUNCTION_VALUE_DISPATCH: u64 = 125;
+
+    public fun get_function_value_dispatch_feature(): u64 {
+        FUNCTION_VALUE_DISPATCH
+    }
+
+    /// Requires function reflection, without which function-value dispatch stays disabled.
+    public fun is_function_value_dispatch_enabled(): bool {
+        is_enabled(FUNCTION_VALUE_DISPATCH) && is_enabled(FUNCTION_REFLECTION)
+    }
+
+    /// Whether lazy module initialization via `aptos_framework::init::internal_maybe_initialize`
+    /// is enabled. While disabled, that entry point aborts.
+    /// Lifetime: transient
+    const LAZY_MODULE_INITIALIZATION: u64 = 127;
+
+    public fun is_lazy_module_initialization_enabled(): bool {
+        is_enabled(LAZY_MODULE_INITIALIZATION)
+    }
+
     // ============================================================================================
     // Feature Flag Implementation
 
@@ -987,12 +1035,14 @@ module std::features {
             move_to<Features>(framework, Features { features: vector[] })
         };
         let features = &mut Features[@std].features;
-        enable.for_each_ref(|feature| {
-            set(features, *feature, true);
-        });
-        disable.for_each_ref(|feature| {
-            set(features, *feature, false);
-        });
+        // `for_each_ref` is not supported in verification since
+        // bit-vector integer mutation is unsupported (TODO(#20375)).
+        for (i in 0..enable.length()) {
+            set(features, enable[i], true);
+        };
+        for (i in 0..disable.length()) {
+            set(features, disable[i], false);
+        };
     }
 
     /// Enable and disable features for the next epoch.

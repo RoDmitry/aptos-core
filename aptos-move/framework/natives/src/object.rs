@@ -1,10 +1,12 @@
 // Copyright (c) Aptos Foundation
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
-use aptos_gas_schedule::gas_params::natives::aptos_framework::*;
+use aptos_gas_schedule::{
+    gas_feature_versions::RELEASE_V1_50, gas_params::natives::aptos_framework::*,
+};
 use aptos_native_interface::{
     safely_assert_eq, safely_pop_arg, RawSafeNative, SafeNativeBuilder, SafeNativeContext,
-    SafeNativeResult,
+    SafeNativeError, SafeNativeResult,
 };
 use aptos_types::transaction::authenticator::AuthenticationKey;
 use better_any::{Tid, TidAble};
@@ -25,6 +27,10 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
 };
+
+/// Returned by `exists_at` when its type argument is not a resource (struct) type with the
+/// `key` ability.
+const ENOT_A_RESOURCE_TYPE: u64 = 11;
 
 /// Cached emitted module events.
 #[derive(Default, Tid)]
@@ -78,22 +84,40 @@ fn native_exists_at(
     safely_assert_eq!(ty_args.len(), 1);
     safely_assert_eq!(args.len(), 1);
 
-    let type_ = &ty_args[0];
+    let ty = &ty_args[0];
     let address = safely_pop_arg!(args, AccountAddress);
 
     context.charge(OBJECT_EXISTS_AT_BASE)?;
 
-    let (exists, num_bytes) = context.exists_at(address, type_).map_err(|err| {
-        PartialVMError::new(StatusCode::VM_EXTENSION_ERROR).with_message(format!(
-            "Failed to read resource: {:?} at {}. With error: {}",
-            type_, address, err
-        ))
-    })?;
+    // Only structs can be resources in global storage. A non-struct type (e.g., a function type
+    // that declared the `key` ability) would reach the data cache and trip a VM invariant
+    // violation, so reject it here with a deterministic, kept abort instead.
+    if context.gas_feature_version() >= RELEASE_V1_50 && !ty.is_struct_or_enum() {
+        return Err(SafeNativeError::abort_with_message(
+            ENOT_A_RESOURCE_TYPE,
+            "Object type argument must be a resource (struct) type",
+        ));
+    }
+
+    let (gv, num_bytes, amount) =
+        context
+            .load_resource_with_abs_sizes(address, ty)
+            .map_err(|err| {
+                PartialVMError::new(StatusCode::VM_EXTENSION_ERROR).with_message(format!(
+                    "Failed to read resource: {:?} at {}. With error: {}",
+                    ty, address, err
+                ))
+            })?;
+    let exists = gv.exists();
 
     if let Some(num_bytes) = num_bytes {
         context.charge(
             OBJECT_EXISTS_AT_PER_ITEM_LOADED + OBJECT_EXISTS_AT_PER_BYTE_LOADED * num_bytes,
         )?;
+    }
+    if let Some((heap_size, val_size)) = amount {
+        context.use_heap_memory(heap_size)?;
+        context.charge_value_traversal(val_size)?;
     }
 
     Ok(smallvec![Value::bool(exists)])

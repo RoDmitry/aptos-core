@@ -59,8 +59,15 @@ fn native_to_bytes(
     debug_assert!(ty_args.len() == 1);
     debug_assert!(args.len() == 1);
 
-    let ref_to_val = safely_pop_arg!(args, Reference);
+    let reference_value = safely_pop_arg!(args);
     let arg_type = &ty_args[0];
+
+    // Charge for the value traversal before (read_ref's deep copy, later
+    // serialization traversal and drop).
+    if context.timed_feature_enabled(TimedFeatureFlag::MeterBcsByValueSize) {
+        let size = context.abs_val_size_dereferenced(&reference_value)?;
+        context.charge_value_traversal(size)?;
+    }
 
     let layout = if context.get_feature_flags().is_lazy_loading_enabled() {
         // With lazy loading, propagate the error directly. This is because errors here are likely
@@ -86,13 +93,20 @@ fn native_to_bytes(
 
     // TODO(#14175): Reading the reference performs a deep copy, and we can
     //               implement it in a more efficient way.
+    let ref_to_val = reference_value
+        .value_as::<Reference>()
+        .map_err(SafeNativeError::InvariantViolation)?;
     let val = ref_to_val.read_ref()?;
 
+    let closure_serialization_disabled = context
+        .get_feature_flags()
+        .is_closure_bcs_serialization_disabled();
     let function_value_extension = context.function_value_extension();
     let max_value_nest_depth = context.max_value_nest_depth();
     let serialized_value = match ValueSerDeContext::new(max_value_nest_depth)
         .with_legacy_signer()
         .with_func_args_deserialization(&function_value_extension)
+        .with_closure_serialization_disabled(closure_serialization_disabled)
         .serialize(&val, &layout)?
     {
         Some(serialized_value) => serialized_value,
@@ -126,8 +140,19 @@ fn native_serialized_size(
 
     context.charge(BCS_SERIALIZED_SIZE_BASE)?;
 
-    let reference = safely_pop_arg!(args, Reference);
+    let reference_value = safely_pop_arg!(args);
     let ty = &ty_args[0];
+
+    // Charge for the value traversal before (read_ref's deep copy, later
+    // serialization traversal and drop).
+    if context.timed_feature_enabled(TimedFeatureFlag::MeterBcsByValueSize) {
+        let size = context.abs_val_size_dereferenced(&reference_value)?;
+        context.charge_value_traversal(size)?;
+    }
+
+    let reference = reference_value
+        .value_as::<Reference>()
+        .map_err(SafeNativeError::InvariantViolation)?;
 
     let serialized_size = match serialized_size_impl(context, reference, ty) {
         Ok(serialized_size) => serialized_size as u64,
@@ -153,12 +178,16 @@ fn serialized_size_impl(
     let value = reference.read_ref()?;
     let ty_layout = context.type_to_type_layout(ty)?;
 
+    let closure_serialization_disabled = context
+        .get_feature_flags()
+        .is_closure_bcs_serialization_disabled();
     let function_value_extension = context.function_value_extension();
     let max_value_nest_depth = context.max_value_nest_depth();
     ValueSerDeContext::new(max_value_nest_depth)
         .with_legacy_signer()
         .with_func_args_deserialization(&function_value_extension)
         .with_delayed_fields_serde()
+        .with_closure_serialization_disabled(closure_serialization_disabled)
         .serialized_size(&value, &ty_layout)
 }
 

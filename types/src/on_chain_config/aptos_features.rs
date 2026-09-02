@@ -99,7 +99,9 @@ pub enum FeatureFlag {
     /// Enabled on mainnet, cannot be disabled.
     _USE_COMPATIBILITY_CHECKER_V2 = 73,
     ENABLE_ENUM_TYPES = 74,
-    ENABLE_RESOURCE_ACCESS_CONTROL = 75,
+    /// Never enabled. Resource access control was removed; access specifiers are
+    /// permanently rejected by the verifier.
+    _DEPRECATED_ENABLE_RESOURCE_ACCESS_CONTROL = 75,
     /// Enabled on mainnet, can never be disabled.
     _REJECT_UNSTABLE_BYTECODE_FOR_SCRIPT = 76,
     FEDERATED_KEYLESS = 77,
@@ -128,8 +130,8 @@ pub enum FeatureFlag {
     /// implementations. If required in the future, we can add a flag
     /// to explicitly disable the instruction cache.
     ENABLE_CALL_TREE_AND_INSTRUCTION_VM_CACHE = 83,
-    /// AIP-103 (https://github.com/aptos-foundation/AIPs/blob/main/aips/aip-103.md)
-    PERMISSIONED_SIGNER = 84,
+    /// AIP-103; the permissioned signer feature has been removed.
+    _DEPRECATED_PERMISSIONED_SIGNER = 84,
     ACCOUNT_ABSTRACTION = 85,
     /// Enables bytecode version v8
     VM_BINARY_FORMAT_V8 = 86,
@@ -205,6 +207,24 @@ pub enum FeatureFlag {
     /// When enabled, execution populates `TransactionInfoV1`'s hot state root hash, so it
     /// is committed to the ledger accumulator. Requires `TRANSACTION_INFO_V1`.
     HOT_STATE_ROOT_IN_TXN_INFO = 123,
+    /// When enabled, the gas refund in the epilogue mints APT directly as a fungible asset
+    /// via the paired `MintRef`, instead of minting a coin and converting it. This avoids
+    /// touching the legacy coin supply aggregator (v1), reducing Block-STM contention.
+    GAS_REFUND_FA_MINT = 124,
+    /// When enabled, `FunctionInfo`-based dispatch (dispatchable fungible assets and
+    /// account abstraction) runs via function values from `std::reflect` instead of the
+    /// legacy native dispatch machinery. Requires `ENABLE_FUNCTION_REFLECTION`.
+    FUNCTION_VALUE_DISPATCH = 125,
+    /// When enabled, BCS serialization of values containing function values fails:
+    /// `bcs::to_bytes` and `bcs::serialized_size` abort, and table operations with keys
+    /// containing function values fail. Storage writes and events are unaffected.
+    /// Transient: active while the function value storage format migration is in
+    /// progress, so no on-chain state can depend on the old bytes.
+    DISABLE_CLOSURE_BCS_SERIALIZATION = 126,
+    /// Enables lazy module initialization via `aptos_framework::init::internal_maybe_initialize`
+    /// (a module self-initializes on first use rather than via a genesis-time `init_module`).
+    /// While disabled, that entry point aborts.
+    LAZY_MODULE_INITIALIZATION = 127,
 }
 
 impl FeatureFlag {
@@ -282,14 +302,12 @@ impl FeatureFlag {
             Self::ALLOW_SERIALIZED_SCRIPT_ARGS,
             Self::_USE_COMPATIBILITY_CHECKER_V2,
             Self::ENABLE_ENUM_TYPES,
-            Self::ENABLE_RESOURCE_ACCESS_CONTROL,
             Self::_REJECT_UNSTABLE_BYTECODE_FOR_SCRIPT,
             Self::TRANSACTION_SIMULATION_ENHANCEMENT,
             Self::_NATIVE_MEMORY_OPERATIONS,
             Self::_ENABLE_LOADER_V2,
             Self::_DISALLOW_INIT_MODULE_TO_PUBLISH_MODULES,
             Self::COLLECTION_OWNER,
-            Self::PERMISSIONED_SIGNER,
             Self::ENABLE_CALL_TREE_AND_INSTRUCTION_VM_CACHE,
             Self::ACCOUNT_ABSTRACTION,
             Self::BULLETPROOFS_BATCH_NATIVES,
@@ -562,6 +580,14 @@ impl Features {
 
     pub fn is_hot_state_root_in_txn_info_enabled(&self) -> bool {
         self.is_enabled(FeatureFlag::HOT_STATE_ROOT_IN_TXN_INFO)
+    }
+
+    pub fn is_gas_refund_fa_mint_enabled(&self) -> bool {
+        self.is_enabled(FeatureFlag::GAS_REFUND_FA_MINT)
+    }
+
+    pub fn is_closure_bcs_serialization_disabled(&self) -> bool {
+        self.is_enabled(FeatureFlag::DISABLE_CLOSURE_BCS_SERIALIZATION)
     }
 
     pub fn get_max_identifier_size(&self) -> u64 {

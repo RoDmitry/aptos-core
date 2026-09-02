@@ -1,7 +1,7 @@
 // Copyright (c) Aptos Foundation
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
-use crate::{ExecutionErrorKind, IntoExecutionError, RuntimeError, RuntimeInvariantViolation};
+use crate::{ExecutionErrorKind, IntoExecutionError, VMInternalError};
 use thiserror::Error;
 
 /// Terminal outcome of a native function invocation.
@@ -11,36 +11,36 @@ pub enum NativeStatus {
     Abort { code: u64, message: Option<String> },
 }
 
-/// A [`RuntimeError`] raised by a VM-internal mechanism a native invoked.
-///
-/// Intended ONLY for errors the native should propagate straight back to the VM
-/// runtime, never inspect itself.
 #[derive(Debug, Error)]
-#[error(transparent)]
-pub struct VMInternalError(RuntimeError);
+#[error("native function invariant violation: {0}")]
+struct NativeInvariantViolation(String);
 
-impl VMInternalError {
-    /// Wraps an invariant violation raised by a native function itself.
-    pub fn invariant_violation(message: String) -> Self {
-        Self(RuntimeError::InvariantViolation(
-            RuntimeInvariantViolation::Native(message),
-        ))
-    }
-
-    /// Unwraps the underlying runtime error.
-    pub fn into_runtime_error(self) -> RuntimeError {
-        self.0
-    }
-}
-
-impl From<RuntimeError> for VMInternalError {
-    fn from(err: RuntimeError) -> Self {
-        Self(err)
-    }
-}
-
-impl IntoExecutionError for VMInternalError {
+impl IntoExecutionError for NativeInvariantViolation {
     fn kind(&self) -> ExecutionErrorKind {
-        self.0.kind()
+        ExecutionErrorKind::InvariantViolation
     }
+}
+
+/// Wraps an invariant violation raised by a native function itself.
+pub fn native_invariant_violation(message: String) -> VMInternalError {
+    VMInternalError::new(NativeInvariantViolation(message))
+}
+
+#[derive(Debug, Error)]
+#[error("vector index out of bounds: index {idx}, length {len}")]
+struct NativeVectorIndexOutOfBounds {
+    idx: u64,
+    len: u64,
+}
+
+impl IntoExecutionError for NativeVectorIndexOutOfBounds {
+    fn kind(&self) -> ExecutionErrorKind {
+        ExecutionErrorKind::InvalidOperation
+    }
+}
+
+// TODO(cleanup): move runtime errors to core to reuse
+// `RuntimeError::VectorIndexOutOfBounds` instead of this native-specific error.
+pub fn native_vector_index_out_of_bounds(idx: u64, len: u64) -> VMInternalError {
+    VMInternalError::new(NativeVectorIndexOutOfBounds { idx, len })
 }

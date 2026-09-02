@@ -90,7 +90,7 @@ struct FunctionVerifier<'a, P: DescriptorProvider + LayoutProvider + ?Sized> {
 
 impl<P: DescriptorProvider + LayoutProvider + ?Sized> FunctionVerifier<'_, P> {
     fn verify(&mut self) {
-        let code = self.func.code.get();
+        let code = self.func.code.ops();
 
         let base_offsets = &self.func.frame_layout.heap_ptr_offsets;
         let safe_point_layouts = self.func.safe_point_layouts.entries();
@@ -136,6 +136,22 @@ impl<P: DescriptorProvider + LayoutProvider + ?Sized> FunctionVerifier<'_, P> {
                 format!(
                     "param_and_local_sizes_sum ({}) must be 8-byte aligned",
                     self.func.param_and_local_sizes_sum
+                ),
+            );
+        }
+
+        // Origins: bytecode provenance parallel to the code.
+        // Either absent (hand-built functions with no bytecode ancestry) or
+        // one entry per micro-op; a partial table would attribute errors to
+        // wrong bytecode offsets.
+        let origins = self.func.code.origins();
+        if !origins.is_empty() && origins.len() != code.len() {
+            self.err(
+                None,
+                format!(
+                    "origins table has {} entries for {} micro-ops (must be empty or parallel)",
+                    origins.len(),
+                    code.len()
                 ),
             );
         }
@@ -558,7 +574,7 @@ impl<P: DescriptorProvider + LayoutProvider + ?Sized> FunctionVerifier<'_, P> {
                 self.check_frame_access_1(pc, dst);
             },
 
-            MicroOp::EnumBorrowVariantField { dst, enum_ref, .. } => {
+            MicroOp::EnumBorrowVariantFieldByTag { dst, enum_ref, .. } => {
                 self.check_frame_access(Some(pc), enum_ref, 16);
                 self.check_frame_access(Some(pc), dst, 16);
             },
@@ -576,28 +592,48 @@ impl<P: DescriptorProvider + LayoutProvider + ?Sized> FunctionVerifier<'_, P> {
                 self.check_enum_new(pc, descriptor_id, variant);
             },
 
-            MicroOp::EnumReadVariantField {
-                dst,
-                enum_ref,
+            // Read's `dst` and write's `src` are both the size-wide frame slot
+            // the value moves to/from; the checks are otherwise identical.
+            MicroOp::HeapReadOffset {
+                dst: value_slot,
+                obj_ref,
                 offset,
                 size,
+            }
+            | MicroOp::HeapWriteOffset {
+                obj_ref,
+                offset,
+                src: value_slot,
+                size,
             } => {
-                self.check_frame_access(Some(pc), enum_ref, 16);
+                self.check_frame_access(Some(pc), obj_ref, 16);
                 self.check_nonzero_size(pc, size);
                 self.check_ref_offset_size_no_overflow(pc, offset, size);
-                self.check_frame_access(Some(pc), dst, size);
+                self.check_frame_access(Some(pc), value_slot, size);
             },
 
-            MicroOp::EnumWriteVariantField {
+            // Read's `dst` and write's `src` are both the size-wide frame slot
+            // the field value moves to/from; the checks are otherwise identical.
+            MicroOp::EnumReadVariantFieldByTag {
+                dst: value_slot,
                 enum_ref,
-                offset,
-                src,
+                ref offsets,
+                size,
+            }
+            | MicroOp::EnumWriteVariantFieldByTag {
+                src: value_slot,
+                enum_ref,
+                ref offsets,
                 size,
             } => {
                 self.check_frame_access(Some(pc), enum_ref, 16);
                 self.check_nonzero_size(pc, size);
-                self.check_ref_offset_size_no_overflow(pc, offset, size);
-                self.check_frame_access(Some(pc), src, size);
+                // Any tag may be selected at runtime, so every present offset
+                // must keep `offset + size` within `u32`.
+                for offset in offsets.iter().flatten() {
+                    self.check_ref_offset_size_no_overflow(pc, *offset, size);
+                }
+                self.check_frame_access(Some(pc), value_slot, size);
             },
 
             // Each owned heap pointer at `base + off` is an 8-byte frame slot.
@@ -1247,7 +1283,7 @@ impl<P: DescriptorProvider + LayoutProvider + ?Sized> FunctionVerifier<'_, P> {
 
     // TODO(metering): validate branch gas fields are populated.
     fn check_jump(&mut self, pc: usize, target: CodeOffset) {
-        let code_len = self.func.code.get().len();
+        let code_len = self.func.code.ops().len();
         if (target.0 as usize) >= code_len {
             self.err(
                 Some(pc),

@@ -3,13 +3,14 @@
 
 //! Natives for the `type_info` module.
 
-use crate::{polymorphic_natives, NativeEntry};
+use crate::{
+    monomorphic_natives, polymorphic_natives, transaction_context::TransactionContextExtension,
+    NativeEntry,
+};
 use mono_move_core::{
-    native::{
-        NativeContext, NativeContextFamily, NativeStatus, RootPool, VMInternalError, VMValue,
-        Vector,
-    },
+    native::{NativeContext, NativeContextFamily, NativeStatus, RootPool, VMValue, Vector},
     types::{type_to_string, view_name, view_type, view_type_list, Type},
+    VMResult,
 };
 use move_core_types::account_address::AccountAddress;
 
@@ -24,7 +25,7 @@ use move_core_types::account_address::AccountAddress;
 //
 // TODO(completeness): with monomorphization the name is known at specialization time, so the
 // specializer could write it directly rather than going through a native.
-pub fn native_type_name<C: NativeContext>(ctx: &C) -> Result<NativeStatus, VMInternalError> {
+pub fn native_type_name<C: NativeContext>(ctx: &C) -> VMResult<NativeStatus> {
     let name = type_to_string(ctx.ty_arg(0)?);
     let bytes = ctx.new_byte_vector(name.as_bytes())?;
     // SAFETY: structs are flattened inline rather than heap-boxed, so the
@@ -87,7 +88,7 @@ impl<'a> VMValue<'a> for TypeInfo<'a> {
 // specializer could synthesize this `TypeInfo` directly rather than via a native.
 //
 // TODO(correctness): double check that the result matches the legacy VM's completely.
-pub fn native_type_of<C: NativeContext>(ctx: &C) -> Result<NativeStatus, VMInternalError> {
+pub fn native_type_of<C: NativeContext>(ctx: &C) -> VMResult<NativeStatus> {
     let (address, module_name, struct_name) = match view_type(ctx.ty_arg(0)?) {
         Type::Nominal {
             module_id,
@@ -137,10 +138,33 @@ pub fn native_type_of<C: NativeContext>(ctx: &C) -> Result<NativeStatus, VMInter
     Ok(NativeStatus::Success)
 }
 
+/// `0x1::type_info::chain_id_internal(): u8`
+///
+/// Returns the chain ID of the network, and is therefore always available. This
+/// is NOT the chain ID of the user transaction, which may be different and not
+/// even available for some transaction types.
+//
+// TODO(metering): charge gas.
+pub fn native_type_info_chain_id<C: NativeContext>(ctx: &C) -> VMResult<NativeStatus> {
+    let ext = ctx.get_extension::<TransactionContextExtension>()?;
+    // SAFETY: return 0 is `u8`.
+    unsafe { ctx.set_return(0, ext.network_chain_id())? };
+    Ok(NativeStatus::Success)
+}
+
 /// Natives for the `type_info` module.
 pub fn make_all_type_info_natives<F: NativeContextFamily>() -> Vec<NativeEntry<F>> {
-    polymorphic_natives![
+    let mut natives = polymorphic_natives![
         ("0x1::type_info::type_name", native_type_name),
         ("0x1::type_info::type_of", native_type_of),
-    ]
+    ];
+    // `chain_id_internal` is non-generic, so it registers as a monomorphic entry
+    // with empty type arguments. Unlike `transaction_context::chain_id_internal`,
+    // it is always available and never aborts on a missing user transaction
+    // context.
+    natives.extend(monomorphic_natives![(
+        "0x1::type_info::chain_id_internal",
+        native_type_info_chain_id
+    )]);
+    natives
 }
