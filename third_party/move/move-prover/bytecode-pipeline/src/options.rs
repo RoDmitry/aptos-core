@@ -91,12 +91,29 @@ pub struct ProverOptions {
     /// Do not add `pragma opaque` to inferred specs.
     #[arg(long)]
     pub no_inference_opaque: bool,
+    /// Report a loop without an invariant that leaves inferred conditions
+    /// untrusted as an error rather than a warning.
+    ///
+    /// The default is a warning: ordinary use still wants whatever WP could
+    /// derive, and the caller decides what to do about the gap. That is the
+    /// wrong default when the inferred specification is consumed
+    /// automatically, because WP drops the untrusted clauses and emits an
+    /// empty `aborts_if_is_partial` contract -- which compiles and verifies,
+    /// and so is indistinguishable from a complete one to anything that only
+    /// checks whether the prover succeeded.
+    #[arg(long)]
+    pub uninvariant_loop_is_error: bool,
+    /// Report an abort characterization which WP cannot make exact as an error
+    /// rather than emitting `aborts_if_is_partial`, including partiality
+    /// inherited from a callee whose own contract is partial.
+    #[arg(long)]
+    pub aborts_if_is_strict: bool,
     /// Optional names of native methods (qualified with module name, e.g., m::foo) implementing
     /// mutable borrow semantics
     #[arg(skip)]
     pub borrow_natives: Vec<String>,
     /// Targets to exclude from verification. Each entry must be
-    /// `VerificationScope::Only(name)` or `VerificationScope::OnlyModule(name)`.
+    /// `VerificationScope::Only(names)` or `VerificationScope::OnlyModule(name)`.
     #[arg(skip)]
     pub verify_exclude: Vec<VerificationScope>,
     /// Inline spec let bindings by substituting the expression directly into conditions,
@@ -127,6 +144,8 @@ impl Default for ProverOptions {
             loop_invariant_evidence_depth: None,
             no_infer_lambda_specs: false,
             no_inference_opaque: false,
+            uninvariant_loop_is_error: false,
+            aborts_if_is_strict: false,
             borrow_natives: vec![],
             verify_exclude: vec![],
             inline_spec_lets: false,

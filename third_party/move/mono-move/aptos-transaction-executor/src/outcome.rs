@@ -6,23 +6,33 @@ use crate::{
         DiscardReason, ExecutionStatus, MaterializationError, NoEffectsReason, SystemTxnFailure,
     },
     materialize,
-    providers::AptosDataProvider,
+    providers::{AptosDataProvider, MaterializedGroups},
 };
 use aptos_types::{
     fee_statement::FeeStatement,
     on_chain_config::Features,
     transaction::{TransactionAuxiliaryData, TransactionOutput, TransactionStatus},
 };
+use mono_move_core::{value_layout::LayoutProvider, VMInternalError, VMResult};
 use mono_move_runtime::SessionEffects;
 
 /// The outcome of one transaction, not yet materialized into a write set.
 /// Intended to be consumed by the block coordinator for efficient handling.
-pub enum TxnOutcome<'guard> {
-    /// Rejected without side effects.
-    Discarded(DiscardReason),
+pub enum TxnOutcome {
+    /// Rejected without side effects. The effects are carried only so the
+    /// session's reads are available; nothing here may be published.
+    Discarded {
+        reason: DiscardReason,
+        /// `None` when the transaction was rejected before a session existed.
+        effects: Option<SessionEffects>,
+    },
     /// A system transaction failed unexpectedly: there is no per-transaction
     /// output, and the whole block must be aborted.
     UnexpectedSystemTransactionFailure(SystemTxnFailure),
+    /// Closing the session failed, which happens only on a VM bug. Neither the
+    /// reads nor the writes survive it, so there is no per-transaction output
+    /// and the block must be aborted.
+    Panic(VMInternalError),
     /// Committed with no side effects and a zero fee. The reason distinguishes
     /// a transaction that had nothing to do from a block epilogue whose
     /// failure was absorbed; both render as an empty success.
@@ -32,36 +42,53 @@ pub enum TxnOutcome<'guard> {
     Executed {
         status: ExecutionStatus,
         fee_statement: FeeStatement,
-        effects: SessionEffects<'guard>,
+        effects: SessionEffects,
     },
 }
 
-impl TxnOutcome<'_> {
+impl TxnOutcome {
     pub fn is_discarded(&self) -> bool {
-        matches!(self, TxnOutcome::Discarded(_))
+        matches!(self, TxnOutcome::Discarded { .. })
+    }
+
+    /// Whether this transaction emitted a reconfiguration (new-epoch) event. The
+    /// block executor skips the remaining transactions when one occurs.
+    pub fn has_new_epoch_event(&self) -> VMResult<bool> {
+        match self {
+            TxnOutcome::Executed { effects, .. } => mono_move_output::has_new_epoch_event(effects),
+            TxnOutcome::Discarded { .. }
+            | TxnOutcome::UnexpectedSystemTransactionFailure(_)
+            | TxnOutcome::Panic(_)
+            | TxnOutcome::ExecutedNoEffects(_) => Ok(false),
+        }
     }
 
     /// Forces the outcome into a `TransactionOutput`: converts the status,
     /// serializes writes (merging resource-group members), and finalizes
-    /// events. Fails only if the effects cannot be converted to storage
-    /// formats, e.g. BCS serialized, which is abnormal — unlike a discard,
-    /// which is a normal outcome carried in the output's status.
-    /// `provider` must be the exact provider instance used for execution so its
-    /// pointer-keyed caches and resource-group pre-state match the effects;
-    /// materialization rejects a different provider.
+    /// events. Also returns the resource groups it assembled, so a caller can
+    /// cache them without re-decoding the write set. Fails only if the effects
+    /// cannot be converted to storage formats, e.g. BCS serialized, which is
+    /// abnormal — unlike a discard, which is a normal outcome carried in the
+    /// output's status. `layouts` must describe the written and event values'
+    /// interned types, and `provider` supplies resource-group pre-state for
+    /// member merges.
     //
     // TODO(perf): this is only intended for compatibility and testing, and
     // the block coordinator should eventually handle the effects directly.
     pub fn materialize(
         self,
+        layouts: &impl LayoutProvider,
         provider: &dyn AptosDataProvider,
         features: &Features,
         auxiliary_data: TransactionAuxiliaryData,
-    ) -> Result<TransactionOutput, MaterializationError> {
+    ) -> Result<(TransactionOutput, MaterializedGroups), MaterializationError> {
         match self {
-            TxnOutcome::Discarded(reason) => Ok(materialize::discarded_output(
-                materialize::discard_to_vm_status(reason).status_code(),
-                auxiliary_data,
+            TxnOutcome::Discarded { reason, .. } => Ok((
+                materialize::discarded_output(
+                    materialize::discard_to_vm_status(reason).status_code(),
+                    auxiliary_data,
+                ),
+                MaterializedGroups::new(),
             )),
             // A fatally failed system transaction has no output; the block
             // coordinator aborts the block instead.
@@ -71,9 +98,13 @@ impl TxnOutcome<'_> {
                     failure.call, failure.failure
                 )]))
             },
-            TxnOutcome::ExecutedNoEffects(_) => {
-                Ok(materialize::empty_success_output(auxiliary_data))
-            },
+            TxnOutcome::Panic(err) => Err(MaterializationError::new(vec![format!(
+                "session could not be closed: {err:?}"
+            )])),
+            TxnOutcome::ExecutedNoEffects(_) => Ok((
+                materialize::empty_success_output(auxiliary_data),
+                MaterializedGroups::new(),
+            )),
             TxnOutcome::Executed {
                 status: execution_status,
                 fee_statement,
@@ -85,6 +116,7 @@ impl TxnOutcome<'_> {
                 let txn_status = TransactionStatus::from_vm_status(vm_status, features, true);
                 materialize::executed_output(
                     &effects,
+                    layouts,
                     provider,
                     fee_statement.gas_used(),
                     txn_status,

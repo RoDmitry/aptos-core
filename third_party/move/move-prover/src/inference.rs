@@ -48,6 +48,7 @@ use move_stackless_bytecode::{
     function_target_pipeline::FunctionTargetsHolder, print_targets_with_annotations_for_test,
 };
 use std::{
+    cmp::Reverse,
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
@@ -312,7 +313,7 @@ fn matches_verify_scope(fun: &FunctionEnv, scope: &VerificationScope) -> bool {
     match scope {
         VerificationScope::All => true,
         VerificationScope::Public => fun.is_exposed(),
-        VerificationScope::Only(name) => fun.matches_name(name),
+        VerificationScope::Only(names) => fun.matches_any_name(names),
         VerificationScope::OnlyModule(name) => fun.module_env.matches_name(name),
         VerificationScope::None => false,
     }
@@ -502,7 +503,7 @@ fn output_to_files(env: &GlobalEnv, inferred_sym: Symbol, options: &Options) -> 
             // multiple new spec blocks all targeting `module_close_insert_pos`),
             // stable sort preserves declaration order — concatenate them into a
             // single insertion so `insert_str` produces the correct order.
-            insertions.sort_by(|a, b| b.0.cmp(&a.0));
+            insertions.sort_by_key(|a| Reverse(a.0));
             let mut merged = source;
             let mut i = 0;
             while i < insertions.len() {
@@ -603,21 +604,22 @@ fn generate_fresh_spec_file(
     // by e.g. `use m::{T}`. Add only those missing module aliases. Blindly
     // copying every source import here would create duplicate aliases after
     // the two modules are merged.
-    let self_sym = env.symbol_pool().make("Self");
-    let existing_default_module_aliases: BTreeSet<_> = module
+    // Keyed by the name each import binds, not by module id: a use declaration
+    // the model did not resolve carries no module id, drops out of this set,
+    // and the alias is then emitted a second time -- a duplicate-alias error
+    // that stops the whole package compiling. The qualifier is what collides,
+    // so the qualifier is what is compared.
+    let pool = env.symbol_pool();
+    let existing_default_module_aliases: BTreeSet<String> = module
         .get_use_decls()
         .iter()
-        .filter(|declaration| {
-            // `use m;`, `use m as A;` and `use m::{Self, ..}` all bring the
-            // module name itself into scope; `use m::{T}` does not.
-            declaration.alias.is_some()
-                || declaration.members.is_empty()
-                || declaration
-                    .members
-                    .iter()
-                    .any(|(_, member, _)| *member == self_sym)
+        .filter(|declaration| declaration.binds_module_qualifier(pool))
+        .map(|declaration| {
+            let bound = declaration
+                .alias
+                .unwrap_or_else(|| declaration.module_name.name());
+            bound.display(pool).to_string()
         })
-        .filter_map(|declaration| declaration.module_id)
         .collect();
     let mut imported_modules = BTreeSet::new();
     for fun in module.get_functions() {
@@ -643,7 +645,15 @@ fn generate_fresh_spec_file(
         }
     }
     imported_modules.remove(&module.get_id());
-    imported_modules.retain(|mid| !existing_default_module_aliases.contains(mid));
+    imported_modules.retain(|mid| {
+        let name = env
+            .get_module(*mid)
+            .get_name()
+            .name()
+            .display(env.symbol_pool())
+            .to_string();
+        !existing_default_module_aliases.contains(&name)
+    });
     for imported in imported_modules {
         emitln!(
             sourcifier.writer(),
@@ -674,7 +684,13 @@ fn generate_fresh_spec_file(
         // uninformative `aborts_if true` from a function which can also return.
         // The run-local target marker is therefore authoritative here.
         if has_inferred_output(&fun, inferred_sym) {
-            sourcifier.print_fun_spec(&fun);
+            // A companion module is merged with the implementation module and
+            // therefore inherits all of its aliases. Fully qualify external
+            // signature types so a same-named alias cannot retarget a type or
+            // suppress the import that would otherwise disambiguate it.
+            let mut signature_tctx = fun.get_type_display_ctx();
+            signature_tctx.fully_qualify_external_types = true;
+            sourcifier.print_fun_spec_with_signature_type_display_ctx(&fun, signature_tctx);
         }
         fun.get_mut_spec().conditions = original_conditions;
     }
@@ -881,7 +897,7 @@ fn output_unified(env: &GlobalEnv, inferred_sym: Symbol, options: &Options) -> a
 
         // Sort insertions by byte offset in reverse order so earlier offsets
         // aren't invalidated by prior insertions.
-        insertions.sort_by(|a, b| b.0.cmp(&a.0));
+        insertions.sort_by_key(|a| Reverse(a.0));
 
         let mut result = source;
         for (offset, text) in &insertions {
@@ -1107,7 +1123,13 @@ fn generate_full_spec_block(
         original
     };
 
-    sourcifier.print_fun_spec(fun);
+    // The generated block is inserted into a companion spec module. Imports
+    // emitted inside the block cannot qualify types in the repeated function
+    // signature because the signature is parsed before the block body. Use
+    // absolute module paths there, just as fresh companion files do.
+    let mut signature_tctx = fun.get_type_display_ctx();
+    signature_tctx.fully_qualify_external_types = true;
+    sourcifier.print_fun_spec_with_signature_type_display_ctx(fun, signature_tctx);
 
     // Restore original conditions.
     fun.get_mut_spec().conditions = original_conditions;

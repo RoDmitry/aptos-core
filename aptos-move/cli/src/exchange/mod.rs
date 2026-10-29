@@ -43,12 +43,15 @@ use move_model::{
     pragmas::ABORTS_IF_IS_STRICT_PRAGMA,
 };
 use move_model_exchange as exchange;
+pub use move_model_exchange::{dump_ast_module, module_closure, select_modules};
 use move_stackless_bytecode::{
     function_target_pipeline::{FunctionTargetsHolder, FunctionVariant},
     graph::{DomRelation, Graph},
     stackless_bytecode::{AttrId, Bytecode, Constant, Label, Operation, PropKind},
 };
-pub use source::{move_file_to_module, move_source_to_module};
+#[cfg(test)]
+pub(crate) use source::single_file_options;
+pub use source::{move_file_to_ast, move_file_to_module, move_source_to_module};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Runs the full frontend: masm source to the exchange module.
@@ -781,7 +784,9 @@ fn constant_value(cons: &Constant) -> Result<exchange::Value> {
         Constant::U32(x) => Ok(exchange::Value::Num(x.to_string())),
         Constant::U64(x) => Ok(exchange::Value::Num(x.to_string())),
         Constant::U128(x) => Ok(exchange::Value::Num(x.to_string())),
-        Constant::U256(x) => Ok(exchange::Value::Num(x.to_string())),
+        Constant::U256(x) => Ok(exchange::Value::Num(
+            move_core_types::int256::U256::from(*x).to_string(),
+        )),
         Constant::Address(Address::Numerical(a)) => {
             Ok(exchange::Value::Address(a.to_hex_literal()))
         },
@@ -1236,7 +1241,7 @@ fn collect_loops(
                             },
                             // A call may modify anything; recognized when
                             // spec support lands. For now, reject.
-                            Oper::Function(_) | Oper::FunctionInst(_, _) => bail!(
+                            Oper::Function(_) | Oper::FunctionInst(_, _) | Oper::Invoke => bail!(
                                 "calls inside loops not yet supported by loop-target collection"
                             ),
                             // A reference write may target any borrowed
@@ -1292,11 +1297,17 @@ fn collect_loops(
                             | Oper::BorrowLoc
                             | Oper::BorrowField(_)
                             | Oper::BorrowFieldInst(_, _)
+                            | Oper::BorrowVariantField(_, _)
+                            | Oper::BorrowVariantFieldInst(_, _, _)
                             | Oper::BorrowGlobal(_)
                             | Oper::BorrowGlobalInst(_, _)
                             | Oper::BorrowVecElem
+                            | Oper::TestVariantRef(_)
+                            | Oper::TestVariantRefInst(_, _)
                             | Oper::ReadRef
-                            | Oper::FreezeRef => {},
+                            | Oper::FreezeRef
+                            | Oper::Closure(_, _)
+                            | Oper::ClosureInst(_, _, _) => {},
                         }
                     },
                     exchange::Instr::Nop => {},

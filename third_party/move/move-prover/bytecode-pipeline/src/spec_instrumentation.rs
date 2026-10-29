@@ -24,6 +24,7 @@ use move_model::{
         ABORTS_IF_IS_PARTIAL_PRAGMA, BV_INTERNAL_PRAGMA, CONDITION_ABSTRACT_PROP,
         CONDITION_CONCRETE_PROP, EMITS_IS_PARTIAL_PRAGMA, EMITS_IS_STRICT_PRAGMA,
     },
+    spec_derivation,
     spec_translator::{ProofAction, SpecTranslator, TranslatedSpec},
     symbol::Symbol,
     ty::{PrimitiveType, ReferenceKind, Type, TypeDisplayContext, BOOL_TYPE, NUM_TYPE},
@@ -40,7 +41,9 @@ use move_stackless_bytecode::{
         AbortAction, AssignKind, AttrId, BorrowEdge, BorrowNode, Bytecode, HavocKind, Label,
         Operation, PropKind,
     },
-    usage_analysis, COMPILED_MODULE_AVAILABLE,
+    usage_analysis,
+    usage_analysis::UsageState,
+    COMPILED_MODULE_AVAILABLE,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -62,39 +65,28 @@ const CHOICE_WITNESS_FAILS_MESSAGE: &str = "choice expression requires a witness
 // # Spec Instrumenter
 
 pub struct SpecInstrumentationProcessor {
-    opaque_callee_modifies:
-        Mutex<BTreeMap<QualifiedId<FunId>, BTreeSet<QualifiedInstId<StructId>>>>,
+    /// Memory usage of every function, taken before instrumentation changes the code.
+    usage: Mutex<BTreeMap<QualifiedId<FunId>, UsageState>>,
 }
 
 impl SpecInstrumentationProcessor {
     pub fn new() -> Box<Self> {
         Box::new(Self {
-            opaque_callee_modifies: Mutex::new(BTreeMap::new()),
+            usage: Mutex::new(BTreeMap::new()),
         })
     }
 }
 
 impl FunctionTargetProcessor for SpecInstrumentationProcessor {
     fn initialize(&self, env: &GlobalEnv, targets: &mut FunctionTargetsHolder) {
-        let effects = targets
+        let usage: BTreeMap<_, _> = targets
             .get_funs()
-            .filter_map(|qid| {
-                let fun = env.get_function(qid);
-                fun.is_opaque().then(|| {
-                    let target = targets.get_target(&fun, &FunctionVariant::Baseline);
-                    (
-                        qid,
-                        usage_analysis::get_memory_usage(&target)
-                            .modified
-                            .all
-                            .iter()
-                            .cloned()
-                            .collect(),
-                    )
-                })
+            .map(|qid| {
+                let fun_env = env.get_function(qid);
+                let target = targets.get_target(&fun_env, &FunctionVariant::Baseline);
+                (qid, usage_analysis::get_memory_usage(&target).clone())
             })
             .collect();
-        *self.opaque_callee_modifies.lock().unwrap() = effects;
         // In inference mode the target's specification is intentionally absent
         // or incomplete until SpecInferenceProcessor runs later in the pipeline.
         // Checking caller/callee modifies relations here would therefore reject
@@ -102,7 +94,9 @@ impl FunctionTargetProcessor for SpecInstrumentationProcessor {
         // a frame declaration for memory the target modifies.
         if !ProverOptions::get(env).inference {
             check_modifies(env, targets);
+            check_fun_arg_frames(env, targets, &usage);
         }
+        *self.usage.lock().unwrap() = usage;
     }
 
     fn process(
@@ -122,7 +116,7 @@ impl FunctionTargetProcessor for SpecInstrumentationProcessor {
             verification_analysis::get_info(&FunctionTarget::new(fun_env, &data));
         let is_verified = verification_info.verified;
         let is_inlined = verification_info.inlined;
-        let opaque_callee_modifies = self.opaque_callee_modifies.lock().unwrap().clone();
+        let usage = self.usage.lock().unwrap();
 
         if is_verified {
             // Create a clone of the function data, moving annotations
@@ -135,7 +129,7 @@ impl FunctionTargetProcessor for SpecInstrumentationProcessor {
                 fun_env,
                 verification_data,
                 scc_opt,
-                &opaque_callee_modifies,
+                &usage,
             );
             verification_data = instrumented;
 
@@ -166,14 +160,7 @@ impl FunctionTargetProcessor for SpecInstrumentationProcessor {
 
         // Instrument baseline variant only if it is inlined.
         if is_inlined {
-            let (data, _) = Instrumenter::run(
-                &options,
-                targets,
-                fun_env,
-                data,
-                scc_opt,
-                &opaque_callee_modifies,
-            );
+            let (data, _) = Instrumenter::run(&options, targets, fun_env, data, scc_opt, &usage);
             data
         } else {
             // Clear code but keep function data stub.
@@ -434,6 +421,208 @@ impl SpecInstrumentationProcessor {
     }
 }
 
+/// Returns the set of labels DEFINED by a condition (all range.post labels).
+pub fn defined_state_labels(exp: &Exp) -> BTreeSet<MemoryLabel> {
+    let mut labels = BTreeSet::new();
+    exp.visit_pre_order(&mut |node| {
+        // A bound state is an existential/universal proof obligation, not
+        // a free intermediate state whose definition can be assumed.
+        if matches!(node, ExpData::Quant(..) | ExpData::Lambda(..)) {
+            return false;
+        }
+        if let ExpData::Call(_, op, _) = node {
+            match op {
+                ast::Operation::Behavior(_, range)
+                | ast::Operation::SpecFunction(_, _, range)
+                | ast::Operation::SpecPublish(range)
+                | ast::Operation::SpecRemove(range)
+                | ast::Operation::SpecUpdate(range) => labels.extend(range.post),
+                _ => {},
+            }
+        }
+        true
+    });
+    labels
+}
+
+/// Extract intermediate-state definitions, preserving guards and binding scope.
+/// Merely containing a definition does not make an entire conjunct assumable:
+/// it may also constrain the actual return state. A result projection defines
+/// its intermediate state through the corresponding `ensures_of`, not through
+/// a property of the projected value (which still has to be proved).
+pub fn state_label_defining_fragment<'env>(generator: &impl ExpGenerator<'env>, exp: &Exp) -> Exp {
+    state_label_defining_fragment_in_context(generator, exp, true)
+}
+
+/// Extracts only facts which are entailed by the expression. `positive` is false
+/// in contexts where a Boolean child is merely inspected, rather than asserted.
+/// Result projections still contribute their callee relation in those contexts:
+/// using a projected result denotes the call independently of how that value is
+/// subsequently tested.
+fn state_label_defining_fragment_in_context<'env>(
+    generator: &impl ExpGenerator<'env>,
+    exp: &Exp,
+    positive: bool,
+) -> Exp {
+    use ast::{BehaviorKind, Operation as Op};
+    let env = generator.global_env();
+    let bool_node = || env.new_node(env.get_node_loc(exp.node_id()), BOOL_TYPE.clone());
+    let truth = || ExpData::Value(bool_node(), Value::Bool(true)).into_exp();
+    let and = |a, b| ExpData::Call(bool_node(), Op::And, vec![a, b]).into_exp();
+    let or = |a, b| ExpData::Call(bool_node(), Op::Or, vec![a, b]).into_exp();
+    if defined_state_labels(exp).is_empty() {
+        return truth();
+    }
+    match exp.as_ref() {
+        ExpData::Call(id, op, args) => {
+            let term_children = || {
+                args.iter()
+                    .map(|arg| state_label_defining_fragment_in_context(generator, arg, false))
+                    .fold(truth(), and)
+            };
+            match op {
+                Op::And if positive => and(
+                    state_label_defining_fragment_in_context(generator, &args[0], true),
+                    state_label_defining_fragment_in_context(generator, &args[1], true),
+                ),
+                Op::Or if positive => or(
+                    state_label_defining_fragment_in_context(generator, &args[0], true),
+                    state_label_defining_fragment_in_context(generator, &args[1], true),
+                ),
+                Op::Implies if positive => and(
+                    state_label_defining_fragment_in_context(generator, &args[0], false),
+                    ExpData::Call(bool_node(), Op::Implies, vec![
+                        args[0].clone(),
+                        state_label_defining_fragment_in_context(generator, &args[1], true),
+                    ])
+                    .into_exp(),
+                ),
+                Op::SpecPublish(range) | Op::SpecRemove(range) | Op::SpecUpdate(range)
+                    if positive && range.post.is_some() =>
+                {
+                    let exists_node = bool_node();
+                    env.set_node_instantiation(exists_node, env.get_node_instantiation(*id));
+                    let exists =
+                        ExpData::Call(exists_node, Op::Exists(range.pre), vec![args[0].clone()])
+                            .into_exp();
+                    // Procedure instrumentation has explicit pre-state saves.
+                    // In a behavioral spec body the implicit pre-state is old_.
+                    let exists = if range.pre.is_none() {
+                        generator.mk_old(exists)
+                    } else {
+                        exists
+                    };
+                    let enabled = if matches!(op, Op::SpecPublish(_)) {
+                        generator.mk_not(exists)
+                    } else {
+                        exists
+                    };
+                    and(term_children(), generator.mk_implies(enabled, exp.clone()))
+                },
+                Op::Behavior(kind, range) if range.post.is_some() => {
+                    let definition = match kind {
+                        BehaviorKind::ResultOf => {
+                            let node = bool_node();
+                            env.set_node_instantiation(node, env.get_node_instantiation(*id));
+                            let Type::Fun(inputs, results, _) =
+                                env.get_node_type(args[0].node_id())
+                            else {
+                                return truth();
+                            };
+                            let num_inputs = inputs.flatten().len();
+                            let num_results = results.clone().flatten().len();
+                            let mut canonical_args = args[..1 + num_inputs].to_vec();
+                            for index in 0..num_results {
+                                canonical_args.push(generator.mk_result_of_at_with_state(
+                                    args[0].clone(),
+                                    args[1..].to_vec(),
+                                    &results,
+                                    index,
+                                    num_results,
+                                    range.pre,
+                                    range.post,
+                                ));
+                            }
+                            canonical_args.extend_from_slice(&args[1 + num_inputs..]);
+                            ExpData::Call(
+                                node,
+                                Op::Behavior(BehaviorKind::EnsuresOf, range.clone()),
+                                canonical_args,
+                            )
+                            .into_exp()
+                        },
+                        BehaviorKind::EnsuresOf if positive => exp.clone(),
+                        _ => truth(),
+                    };
+                    // A call's postcondition is available only in its valid,
+                    // non-aborting domain. In particular, an always-aborting
+                    // callee may legitimately have `ensures false`; importing
+                    // that as a definition would prove every abort obligation.
+                    let definition = if matches!(kind, BehaviorKind::ResultOf)
+                        || positive && matches!(kind, BehaviorKind::EnsuresOf)
+                    {
+                        let Type::Fun(inputs, _, _) = env.get_node_type(args[0].node_id()) else {
+                            return truth();
+                        };
+                        let inputs = args[..1 + inputs.flatten().len()].to_vec();
+                        let pre_range = ast::MemoryRange {
+                            pre: range.pre,
+                            post: None,
+                        };
+                        let requires = generator.mk_bool_call(
+                            Op::Behavior(BehaviorKind::RequiresOf, pre_range.clone()),
+                            inputs.clone(),
+                        );
+                        let aborts = generator
+                            .mk_bool_call(Op::Behavior(BehaviorKind::AbortsOf, pre_range), inputs);
+                        generator.mk_implies(and(requires, generator.mk_not(aborts)), definition)
+                    } else {
+                        definition
+                    };
+                    and(term_children(), definition)
+                },
+                Op::SpecFunction(_, _, range)
+                    if positive && range.post.is_some() && env.get_node_type(*id) == BOOL_TYPE =>
+                {
+                    and(term_children(), exp.clone())
+                },
+                // Negation, equivalence, equality on Booleans, and other
+                // non-monotone contexts do not entail their Boolean children.
+                // Descend in term context only to retain call-result relations.
+                _ => term_children(),
+            }
+        },
+        ExpData::Block(_, pattern, binding, body) => {
+            let body = ExpData::Block(
+                bool_node(),
+                pattern.clone(),
+                binding.clone(),
+                state_label_defining_fragment_in_context(generator, body, positive),
+            )
+            .into_exp();
+            if let Some(binding) = binding {
+                and(
+                    state_label_defining_fragment_in_context(generator, binding, false),
+                    body,
+                )
+            } else {
+                body
+            }
+        },
+        ExpData::IfElse(_, cond, then, otherwise) => and(
+            state_label_defining_fragment_in_context(generator, cond, false),
+            ExpData::IfElse(
+                bool_node(),
+                cond.clone(),
+                state_label_defining_fragment_in_context(generator, then, positive),
+                state_label_defining_fragment_in_context(generator, otherwise, positive),
+            )
+            .into_exp(),
+        ),
+        _ => truth(),
+    }
+}
+
 struct Instrumenter<'a> {
     options: &'a ProverOptions,
     builder: FunctionDataBuilder<'a>,
@@ -447,8 +636,11 @@ struct Instrumenter<'a> {
     /// Resource types explicitly framed by opaque callees before call-site type
     /// substitution.
     opaque_callee_framed_memory: BTreeMap<QualifiedId<FunId>, BTreeSet<QualifiedInstId<StructId>>>,
+    memory_free_callees: BTreeSet<QualifiedId<FunId>>,
     /// Unframed memory possibly modified by opaque closures invoked in this function.
     opaque_closure_modifies: BTreeSet<QualifiedInstId<StructId>>,
+    /// Footprints of the closures bound to temporaries of this function.
+    closure_footprints: BTreeMap<TempIndex, ClosureFootprint>,
     /// Map from Nop AttrId to split expression and optional guard (for `split` proof items).
     /// AttrIds are stable across optimization passes, unlike bytecode offsets.
     /// The optional guard is a path condition from enclosing `if` in the proof block.
@@ -470,12 +662,35 @@ impl<'a> Instrumenter<'a> {
         fun_env: &FunctionEnv<'a>,
         data: FunctionData,
         scc_opt: Option<&[FunctionEnv]>,
-        all_opaque_callee_modifies: &BTreeMap<
-            QualifiedId<FunId>,
-            BTreeSet<QualifiedInstId<StructId>>,
-        >,
+        usage: &BTreeMap<QualifiedId<FunId>, UsageState>,
     ) -> (FunctionData, Vec<(AttrId, Exp, Option<Exp>)>) {
         // Pre-collect properties and opaque-callee effects from the original code.
+        let memory_free_callees = data
+            .code
+            .iter()
+            .filter_map(|bc| {
+                let Bytecode::Call(_, _, Operation::Function(mid, fid, _), _, _) = bc else {
+                    return None;
+                };
+                let qid = mid.qualified(*fid);
+                if qid == fun_env.get_qualified_id() {
+                    return None;
+                }
+                let callee = fun_env.module_env.env.get_function(qid);
+                let target = targets.get_target(&callee, &FunctionVariant::Baseline);
+                (usage_analysis::get_memory_usage(&target)
+                    .accessed
+                    .all
+                    .is_empty()
+                    && callee.get_spec_used_memory().is_empty()
+                    && callee.get_spec_generic_used_memory().is_empty()
+                    && callee.get_parameters().iter().all(|p| {
+                        !p.1.is_mutable_reference()
+                            && !matches!(p.1.skip_reference(), Type::Fun(..))
+                    }))
+                .then_some(qid)
+            })
+            .collect();
         let props: Vec<_> = data
             .code
             .iter()
@@ -492,12 +707,16 @@ impl<'a> Instrumenter<'a> {
                 Bytecode::Call(_, _, Operation::Function(mid, fid, _), _, _) => {
                     let callee = fun_env.module_env.env.get_module(*mid).into_function(*fid);
                     callee.is_opaque().then(|| {
+                        let callee_usage = &usage[&mid.qualified(*fid)];
                         (
                             mid.qualified(*fid),
-                            all_opaque_callee_modifies
-                                .get(&mid.qualified(*fid))
+                            callee_usage
+                                .modified
+                                .all
+                                .iter()
+                                .chain(callee_usage.invoke_frame_other.iter())
                                 .cloned()
-                                .unwrap_or_default(),
+                                .collect(),
                         )
                     })
                 },
@@ -520,28 +739,33 @@ impl<'a> Instrumenter<'a> {
                 _ => None,
             })
             .collect();
-        let opaque_closure_modifies = data
-            .code
-            .iter()
-            .filter_map(|bc| match bc {
-                Bytecode::Call(_, _, Operation::Closure(mid, fid, targs, _), _, _) => {
-                    let callee = fun_env.module_env.env.get_module(*mid).into_function(*fid);
-                    callee.is_opaque().then(|| (mid.qualified(*fid), targs))
-                },
-                _ => None,
-            })
-            .flat_map(|(callee_qid, targs)| {
-                let callee = fun_env.module_env.env.get_function(callee_qid);
-                let framed_memory = opaque_framed_memory(fun_env.module_env.env, &callee);
-                all_opaque_callee_modifies
-                    .get(&callee_qid)
-                    .into_iter()
-                    .flatten()
+        let mut opaque_closure_modifies: BTreeSet<QualifiedInstId<StructId>> = BTreeSet::new();
+        for bc in &data.code {
+            let Bytecode::Call(_, _, Operation::Closure(mid, fid, targs, _), _, _) = bc else {
+                continue;
+            };
+            let callee = fun_env.module_env.env.get_module(*mid).into_function(*fid);
+            if !callee.is_opaque() {
+                continue;
+            }
+            let callee_usage = &usage[&mid.qualified(*fid)];
+            let framed_memory = opaque_framed_memory(fun_env.module_env.env, &callee);
+            opaque_closure_modifies.extend(
+                callee_usage
+                    .modified
+                    .all
+                    .iter()
+                    .chain(callee_usage.invoke_frame.all.iter())
                     .filter(|mem| !framed_memory.contains(mem))
-                    .map(|mem| mem.instantiate_ref(targs))
-                    .collect_vec()
-            })
-            .collect();
+                    .map(|mem| mem.instantiate_ref(targs)),
+            );
+        }
+        let closure_footprints = closure_footprints(
+            fun_env.module_env.env,
+            fun_env.get_qualified_id(),
+            usage,
+            &data.code,
+        );
 
         let mut builder = FunctionDataBuilder::new(fun_env, data);
 
@@ -645,7 +869,9 @@ impl<'a> Instrumenter<'a> {
             mem_info: &mem_info,
             opaque_callee_modifies,
             opaque_callee_framed_memory,
+            memory_free_callees,
             opaque_closure_modifies,
+            closure_footprints,
             split_points: vec![],
             self_is_bv_internal: fun_env.is_pragma_true(BV_INTERNAL_PRAGMA, || false),
             concrete_cond_locs: fun_env
@@ -716,15 +942,19 @@ impl<'a> Instrumenter<'a> {
         // Emit `let` bindings.
         self.emit_lets(spec, false, self.self_is_bv_internal);
 
-        // Inject preconditions as assumes. This is done for all self.variant values.
+        // Assume preconditions in the verification variant only. A Baseline body is
+        // inlined into its callers, which assert the callee's caller-visible preconditions
+        // at the call; it assumes nothing they do not check.
         self.builder
             .set_loc(self.builder.fun_env.get_loc().at_start()); // reset to function level
-        for (loc, exp) in spec.pre_conditions(&self.builder) {
-            let is_concrete = self.is_concrete_cond(&loc);
-            self.builder.set_loc(loc);
-            self.builder
-                .emit_with(move |attr_id| Prop(attr_id, Assume, exp));
-            self.tag_contract_prop(self.self_is_bv_internal && !is_concrete);
+        if self.is_verified() {
+            for (loc, exp) in spec.pre_conditions(&self.builder) {
+                let is_concrete = self.is_concrete_cond(&loc);
+                self.builder.set_loc(loc);
+                self.builder
+                    .emit_with(move |attr_id| Prop(attr_id, Assume, exp));
+                self.tag_contract_prop(self.self_is_bv_internal && !is_concrete);
+            }
         }
 
         // Emit well-formedness checks for choice expressions in let bindings.
@@ -1015,25 +1245,15 @@ impl<'a> Instrumenter<'a> {
         self.emit_lets(&callee_spec, false, callee_is_bv_internal);
         self.builder.set_loc_from_attr(id);
 
-        // Emit pre conditions if this is the verification variant or if the callee
-        // is opaque. For inlined callees outside of verification entry points, we skip
-        // emitting any pre-conditions because they are assumed already at entry into the
-        // function.
-        if self.is_verified() || callee_opaque {
-            for (loc, cond) in callee_spec.pre_conditions(&self.builder) {
-                self.emit_traces(&callee_spec, &cond);
-                // Determine whether we want to emit this as an assertion or an assumption.
-                let prop_kind = match self.builder.data.variant {
-                    FunctionVariant::Verification(..) => {
-                        self.builder
-                            .set_loc_and_vc_info(loc, REQUIRES_FAILS_MESSAGE);
-                        Assert
-                    },
-                    FunctionVariant::Baseline => Assume,
-                };
-                self.builder.emit_with(|id| Prop(id, prop_kind, cond));
-                self.tag_contract_prop(callee_is_bv_internal);
-            }
+        // Callee preconditions are the caller's obligation in every variant. A Baseline
+        // body is inlined into the verified roots that call it, so its assertions are
+        // discharged there.
+        for (loc, cond) in callee_spec.pre_conditions(&self.builder) {
+            self.emit_traces(&callee_spec, &cond);
+            self.builder
+                .set_loc_and_vc_info(loc, REQUIRES_FAILS_MESSAGE);
+            self.builder.emit_with(|id| Prop(id, Assert, cond));
+            self.tag_contract_prop(callee_is_bv_internal);
         }
 
         // Emit well-formedness checks for choice expressions in callee's pre-state let bindings.
@@ -1084,6 +1304,49 @@ impl<'a> Instrumenter<'a> {
                 true,
             );
 
+            // The aggregated behavioral predicates assumed on the success
+            // path (see below) take the callee's pre-state arguments, which
+            // for `&mut` arguments are gone once the call havocs them: save
+            // those too.
+            let callee_is_higher_order = callee_env
+                .get_parameters()
+                .iter()
+                .any(|p| matches!(p.1.skip_reference(), Type::Fun(..)));
+            let emits_behavior_aggregate = find_behavior_pre_label_for_callee(spec, mid, fid)
+                .is_some()
+                && !callee_is_higher_order;
+            // The aggregates describe THIS call, so they are stated over the
+            // memory at this call: a fresh label, saved here, for every
+            // resource the callee's evaluator takes. The enclosing
+            // specification's own occurrence of the predicate keeps its entry
+            // label; the two name the same state exactly when nothing the
+            // callee reads was written between entry and the call, which is
+            // what makes a caller's `aborts_if aborts_of<callee>(..)` true or
+            // false. (Binding the aggregates to the entry label instead let a
+            // write before the call be ignored: the success of a call on the
+            // written state was assumed over the entry state, and a later
+            // abort on the same state was pruned as contradictory.)
+            let entry_label = if emits_behavior_aggregate {
+                for src in &srcs {
+                    if self.builder.data.local_types[*src].is_mutable_reference() {
+                        let ty = self.builder.get_local_type(*src).skip_reference().clone();
+                        callee_spec
+                            .saved_params
+                            .entry(*src)
+                            .or_insert_with(|| self.builder.new_temp(ty));
+                    }
+                }
+                let env = self.builder.global_env();
+                let label = MemoryLabel::new(env.new_global_id().as_usize());
+                let callee_qid = mid.qualified(fid);
+                for mem in spec_derivation::behavioral_target_memory(env, callee_qid, targs) {
+                    callee_spec.saved_memory.insert((mem, label));
+                }
+                Some(label)
+            } else {
+                None
+            };
+
             // Emit saves for parameters used in old(..) context. Those can be referred
             // to in aborts conditions, and must be initialized before evaluating those.
             self.emit_save_for_old(&callee_spec.saved_params);
@@ -1104,23 +1367,9 @@ impl<'a> Instrumenter<'a> {
             // aborts_if conditions. Uses abort_path=true to emit only the
             // defining fragment (label-defining conjuncts), not full postcondition
             // properties that reference post-havoc state.
-            let defining_indices =
-                self.emit_state_label_assumes(&callee_spec, true, callee_is_bv_internal);
-            // Remove defining conditions from post so they aren't double-emitted
-            // later when assumes for ensures are emitted on the non-abort path.
-            if !defining_indices.is_empty() {
-                let post_count = callee_spec.post.len();
-                callee_spec.post = callee_spec
-                    .post
-                    .drain(..)
-                    .enumerate()
-                    .filter(|(i, _)| !defining_indices.contains(i))
-                    .map(|(_, v)| v)
-                    .collect();
-                // Adjust aborts indices (they start after post in the combined list)
-                // No adjustment needed — aborts are separate from post in callee_spec
-                let _ = post_count; // suppress unused warning
-            }
+            self.emit_state_label_assumes(&callee_spec, true, callee_is_bv_internal);
+            // Keep the full postconditions for the successful-call path: the
+            // definitions above deliberately omit their final-state properties.
 
             let callee_aborts_if_is_partial =
                 callee_env.is_pragma_true(ABORTS_IF_IS_PARTIAL_PRAGMA, || false);
@@ -1146,15 +1395,11 @@ impl<'a> Instrumenter<'a> {
                     self.tag_contract_prop(callee_is_bv_internal);
                 }
                 // Aggregate `aborts_of<callee>` on the abort path so a
-                // caller's `aborts_of<callee>` assertion discharges directly.
-                // See the success-path comment below `OpaqueCall` end for
-                // soundness and the gating rationale.
-                let abort_callee_is_higher_order = callee_env
-                    .get_parameters()
-                    .iter()
-                    .any(|p| matches!(p.1.skip_reference(), Type::Fun(..)));
-                let abort_entry_label = find_behavior_pre_label_for_callee(spec, mid, fid);
-                if abort_entry_label.is_some() && !abort_callee_is_higher_order {
+                // caller's `aborts_of<callee>` assertion discharges directly,
+                // over the memory saved at this call. See the success-path
+                // comment below `OpaqueCall` end for soundness and the
+                // gating rationale.
+                if emits_behavior_aggregate {
                     let abort_arg_exps: Vec<Exp> =
                         srcs.iter().map(|s| self.builder.mk_temporary(*s)).collect();
                     let (abort_closure_exp, _) =
@@ -1163,7 +1408,7 @@ impl<'a> Instrumenter<'a> {
                     let abort_aborts_exp = self.builder.mk_aborts_of_with_state(
                         abort_closure_exp,
                         abort_arg_exps,
-                        abort_entry_label,
+                        entry_label,
                         None,
                     );
                     self.builder
@@ -1204,6 +1449,22 @@ impl<'a> Instrumenter<'a> {
                 .map(|mem| mem.instantiate_ref(targs))
                 .collect_vec();
             self.emit_global_havocs(unframed_memory);
+
+            // What a function-typed argument may modify: its footprint if it is a known
+            // closure, otherwise the frame the callee declares for the parameter.
+            let mut arg_writes = BTreeSet::new();
+            for (param, src) in callee_env.get_parameters().iter().zip(&srcs) {
+                if !param.1.skip_reference().is_function() {
+                    continue;
+                }
+                if let Some(footprint) = self.closure_footprints.get(src) {
+                    arg_writes.extend(footprint.writes.iter().cloned());
+                } else {
+                    let frame = DeclaredFrame::of_fun_param(&callee_env, param.0, targs);
+                    arg_writes.extend(frame.writes);
+                }
+            }
+            self.emit_global_havocs(arg_writes);
 
             // Havoc all &mut parameters, their post-value are to be determined by the post
             // conditions.
@@ -1319,14 +1580,20 @@ impl<'a> Instrumenter<'a> {
             // the assertion's at the caller's exit). For callees the
             // enclosing spec doesn't mention, our assume would have nothing
             // to discharge and risks using a mismatched label.
-            let callee_is_higher_order = callee_env
-                .get_parameters()
-                .iter()
-                .any(|p| matches!(p.1.skip_reference(), Type::Fun(..)));
-            let entry_label = find_behavior_pre_label_for_callee(spec, mid, fid);
-            if entry_label.is_some() && !callee_is_higher_order {
-                let arg_exps: Vec<Exp> =
-                    srcs.iter().map(|s| self.builder.mk_temporary(*s)).collect();
+            if emits_behavior_aggregate {
+                // Pre-state arguments: a `&mut` argument holds its post-state
+                // here, its pre-state was saved before the call.
+                let arg_exps: Vec<Exp> = srcs
+                    .iter()
+                    .map(|s| {
+                        let pre = if self.builder.data.local_types[*s].is_mutable_reference() {
+                            callee_spec.saved_params[s]
+                        } else {
+                            *s
+                        };
+                        self.builder.mk_temporary(pre)
+                    })
+                    .collect();
                 let (closure_exp, _) =
                     self.builder
                         .mk_closure(mid, fid, targs, ClosureMask::empty(), vec![]);
@@ -1358,6 +1625,60 @@ impl<'a> Instrumenter<'a> {
             }
 
             // Generate OpaqueCallEnd instruction if invariant_v2.
+            // A memory-free Move call is a deterministic function of its inputs.
+            // Its actual return is the result_of carrier even when its stated
+            // postconditions do not uniquely determine that return. The ordinary
+            // contract still constrains the carrier only on successful calls.
+            let uses_result_carrier = spec
+                .pre
+                .iter()
+                .chain(&spec.post)
+                .map(|(_, e)| e)
+                .chain(spec.aborts.iter().map(|(_, e, _)| e))
+                .any(|exp| {
+                    exp.any(&mut |node| {
+                        let ExpData::Call(
+                            _,
+                            ast::Operation::Behavior(ast::BehaviorKind::ResultOf, _),
+                            args,
+                        ) = node
+                        else {
+                            return false;
+                        };
+                        matches!(args.first().map(|a| a.as_ref()),
+                        Some(ExpData::Call(_, ast::Operation::Closure(cmid, cfid, _), _))
+                        if *cmid == mid && *cfid == fid)
+                    })
+                });
+            if uses_result_carrier
+                && self
+                    .memory_free_callees
+                    .contains(&callee_env.get_qualified_id())
+            {
+                let args = srcs
+                    .iter()
+                    .map(|s| self.builder.mk_temporary(*s))
+                    .collect::<Vec<_>>();
+                let (closure, _) =
+                    self.builder
+                        .mk_closure(mid, fid, targs, ClosureMask::empty(), vec![]);
+                let result_ty = callee_env.get_result_type().instantiate(targs);
+                for (i, dest) in dests.iter().enumerate() {
+                    let result = self.builder.mk_result_of_at_with_state(
+                        closure.clone(),
+                        args.clone(),
+                        &result_ty,
+                        i,
+                        dests.len(),
+                        None,
+                        None,
+                    );
+                    let actual = self.builder.mk_temporary(*dest);
+                    let equality = self.builder.mk_eq(actual, result);
+                    self.builder.emit_with(|id| Prop(id, Assume, equality));
+                    self.tag_contract_prop(callee_is_bv_internal);
+                }
+            }
             self.generate_opaque_call(dests, mid, fid, targs, srcs, aa, false);
         }
     }
@@ -2342,28 +2663,11 @@ impl<'a> Instrumenter<'a> {
             // Emit well-formedness checks for choice expressions in post-state let bindings.
             self.emit_choice_wellformedness(spec, true);
 
-            let defining_indices =
-                self.emit_state_label_assumes(spec, false, self.self_is_bv_internal);
+            self.emit_state_label_assumes(spec, false, self.self_is_bv_internal);
 
-            // Emit the negation of all aborts conditions.
-            // For defining conditions (already assumed), assert the non-defining
-            // residual so mixed conditions like `mutation(...) && property` still
-            // verify the property part.
-            let post_count = spec.post.len();
-            for (i, (loc, abort_cond, _)) in spec.aborts.iter().enumerate() {
-                if defining_indices.contains(&(post_count + i)) {
-                    if let Some(residual) = self.non_defining_residual(abort_cond) {
-                        self.emit_traces(spec, abort_cond);
-                        let exp = self.builder.mk_not(residual);
-                        self.builder
-                            .set_loc_and_vc_info(loc.clone(), ABORTS_IF_FAILS_MESSAGE);
-                        self.builder.emit_with(|id| Prop(id, Assert, exp));
-                        self.tag_contract_prop(
-                            self.self_is_bv_internal && !self.is_concrete_cond(loc),
-                        );
-                    }
-                    continue;
-                }
+            // Definitions do not replace proof obligations. Assert the full
+            // condition, including any quantified or final-state properties.
+            for (loc, abort_cond, _) in &spec.aborts {
                 self.emit_traces(spec, abort_cond);
                 let exp = self.builder.mk_not(abort_cond.clone());
                 self.builder
@@ -2378,23 +2682,8 @@ impl<'a> Instrumenter<'a> {
                 self.emit_proof_actions(&spec.post_proof, spec);
             }
 
-            // Emit all post-conditions which must hold.
-            // For defining conditions (already assumed), assert the non-defining
-            // residual so mixed conditions like `mutation(...) && result == 0`
-            // still verify the `result == 0` part.
-            for (i, (loc, cond)) in spec.post.iter().enumerate() {
-                if defining_indices.contains(&i) {
-                    if let Some(residual) = self.non_defining_residual(cond) {
-                        self.emit_traces(spec, cond);
-                        self.builder
-                            .set_loc_and_vc_info(loc.clone(), ENSURES_FAILS_MESSAGE);
-                        self.builder.emit_with(move |id| Prop(id, Assert, residual));
-                        self.tag_contract_prop(
-                            self.self_is_bv_internal && !self.is_concrete_cond(loc),
-                        );
-                    }
-                    continue;
-                }
+            // Prove all postconditions, including mixed definition/property clauses.
+            for (loc, cond) in &spec.post {
                 self.emit_traces(spec, cond);
                 self.builder
                     .set_loc_and_vc_info(loc.clone(), ENSURES_FAILS_MESSAGE);
@@ -2435,9 +2724,8 @@ impl<'a> Instrumenter<'a> {
     /// Collects all conditions (ensures + aborts), finds which ones define state labels,
     /// and emits them as assumes in topological (dependency) order.
     /// Returns the set of condition indices that were emitted as assumes (defining conditions).
-    /// If `abort_path` is true, assume only the defining fragment of each condition
-    /// (conjuncts that contain label-defining operations), not extra properties
-    /// that only hold on successful returns.
+    /// Assume only intermediate-state definitions, never final-state properties,
+    /// on either path. `abort_path` also includes definitions from abort clauses.
     fn emit_state_label_assumes(
         &mut self,
         spec: &TranslatedSpec,
@@ -2530,11 +2818,7 @@ impl<'a> Instrumenter<'a> {
                             continue;
                         }
                         self.emit_traces(spec, all_conditions[idx]);
-                        let cond = if abort_path {
-                            Self::defining_fragment(all_conditions[idx])
-                        } else {
-                            all_conditions[idx].clone()
-                        };
+                        let cond = self.defining_fragment(all_conditions[idx]);
                         self.builder.emit_with(move |id| Prop(id, Assume, cond));
                         self.tag_contract_prop(
                             owner_is_bv_internal && !self.is_concrete_cond(condition_locs[idx]),
@@ -2558,101 +2842,17 @@ impl<'a> Instrumenter<'a> {
         defining_indices
     }
 
-    /// Returns the set of labels DEFINED by a condition (all range.post labels).
     fn defined_labels(exp: &Exp) -> BTreeSet<MemoryLabel> {
-        exp.as_ref().all_defined_labels()
+        defined_state_labels(exp)
     }
 
-    /// Extract the defining fragment of a condition: only the conjuncts that
-    /// contain label-defining operations. Non-defining conjuncts (properties
-    /// that only hold on successful returns) are dropped. Used on the abort
-    /// path to avoid assuming postcondition properties.
-    fn defining_fragment(exp: &Exp) -> Exp {
-        use move_model::exp_simplifier::flatten_conjunction_owned;
-        let conjuncts = flatten_conjunction_owned(exp);
-        let defining: Vec<Exp> = conjuncts
-            .into_iter()
-            .filter(|c| !c.as_ref().all_defined_labels().is_empty())
-            .collect();
-        if defining.is_empty() {
-            // No defining conjuncts — return true (no constraint).
-            let id = exp.as_ref().node_id();
-            ExpData::Value(id, Value::Bool(true)).into_exp()
-        } else {
-            defining
-                .into_iter()
-                .reduce(|a, b| {
-                    let id = a.as_ref().node_id();
-                    ExpData::Call(id, ast::Operation::And, vec![a, b]).into_exp()
-                })
-                .unwrap()
-        }
+    fn defining_fragment(&self, exp: &Exp) -> Exp {
+        state_label_defining_fragment(&self.builder, exp)
     }
 
     /// Returns all labels referenced by a condition.
     fn all_labels(exp: &Exp) -> BTreeSet<MemoryLabel> {
         all_labels_in_exp(exp)
-    }
-
-    /// Compute the non-defining residual of a condition: the condition with all
-    /// label-defining operations neutralized. Mutation builtins are replaced by `true`
-    /// (boolean predicates about state transitions). For behavioral predicates and spec
-    /// functions with `range.post`, stripping the label would change the state context
-    /// (evaluating at exit instead of the labeled intermediate state), producing
-    /// semantically incorrect assertions. For those, no residual is returned.
-    /// Returns `None` if the residual is trivially `true` (pure definition) or if
-    /// the condition contains label-defining Behavior/SpecFunction operations.
-    fn non_defining_residual(&self, exp: &Exp) -> Option<Exp> {
-        // If the condition contains label-defining Behavior or SpecFunction operations,
-        // there is no meaningful residual: stripping the label changes the state context.
-        // The assume already covers the verification obligation.
-        let has_non_mutation_definers = {
-            let mut found = false;
-            exp.as_ref().visit_pre_order(&mut |e| {
-                if let ExpData::Call(_, op, _) = e {
-                    match op {
-                        ast::Operation::Behavior(_, range)
-                        | ast::Operation::SpecFunction(_, _, range)
-                            if range.post.is_some() =>
-                        {
-                            found = true;
-                            return false;
-                        },
-                        _ => {},
-                    }
-                }
-                !found
-            });
-            found
-        };
-        if has_non_mutation_definers {
-            return None;
-        }
-        struct MutationStripper;
-        impl ExpRewriterFunctions for MutationStripper {
-            fn rewrite_call(
-                &mut self,
-                id: move_model::model::NodeId,
-                oper: &ast::Operation,
-                _args: &[Exp],
-            ) -> Option<Exp> {
-                match oper {
-                    ast::Operation::SpecPublish(_)
-                    | ast::Operation::SpecRemove(_)
-                    | ast::Operation::SpecUpdate(_) => {
-                        Some(ExpData::Value(id, Value::Bool(true)).into_exp())
-                    },
-                    _ => None,
-                }
-            }
-        }
-        let mut stripper = MutationStripper;
-        let residual = stripper.rewrite_exp(exp.clone());
-        if matches!(residual.as_ref(), ExpData::Value(_, Value::Bool(true))) {
-            None // Pure definition, no residual to assert
-        } else {
-            Some(residual)
-        }
     }
 
     /// Generate a check whether the target can modify the given memory provided
@@ -2778,15 +2978,10 @@ impl<'a> Instrumenter<'a> {
 /// with the given module/function id; `None` otherwise.
 ///
 /// Used to gate the call-site `assume bp_*_of<callee>(...)` in the opaque
-/// instrumentation: emitting it only when the enclosing spec already has an
-/// assertion of that predicate ensures `spec.saved_memory` was populated
-/// with the right label for the callee's used memory.
-/// Returns the first pre-state label under which the enclosing spec references the
-/// given callee through behavioral predicates.
-/// TODO(#20069): with references anchored at different labels, sequential calls to
-/// the same callee have different entry snapshots, but the aggregated call-site
-/// assumes all bind to this single label; selecting the label per call site needs
-/// a correlation between calls and the abstract state labels they define.
+/// instrumentation: the aggregate is emitted only when the enclosing spec
+/// names the callee through a behavioral predicate, so that it has an
+/// assertion to discharge. The aggregate itself is stated over memory saved
+/// at the call, not under this label.
 /// Walk `stale_lhs` and `fresh_lhs` in parallel to build a stale→fresh
 /// Temporary index map, then rewrite `stale_rhs`'s Temporaries accordingly.
 /// Used at ghost-field update lowering, where the fun-spec keeps a lowered
@@ -2950,6 +3145,268 @@ fn find_behavior_pre_label_for_callee(
 /// # Modifies Checker
 /// Check modifies annotations. This is depending on usage analysis and is therefore
 /// invoked here from the initialize trait function of this processor.
+/// Memory a closure may write and access, from the usage of its target function.
+struct ClosureFootprint {
+    /// Memory havoced across a call the closure is passed to: what its target's usage summary
+    /// writes, and when the closure's effects are known, also what a call to the target
+    /// writes as the prover encodes it (`usage_analysis::call_effects`).
+    writes: BTreeSet<QualifiedInstId<StructId>>,
+    /// Whether the closure's effects are known (`usage_analysis::closures_with_known_footprint`),
+    /// which is what a callee leaving the frame to the call site requires. A closure whose
+    /// effects are not known is rejected by the frame check in target modules; elsewhere,
+    /// `writes` still covers what its target's summary records.
+    known: bool,
+    /// Memory written by the code of the target and its callees.
+    code_writes: BTreeSet<QualifiedInstId<StructId>>,
+    /// Memory read or written by the code of the target and its callees.
+    code_accessed: BTreeSet<QualifiedInstId<StructId>>,
+}
+
+/// Whether `temp` is bound, in `code`, to a closure whose target's usage summary has
+/// `unbounded_invoke`: the target runs a function value whose writes nothing records.
+fn closure_target_has_unbounded_invoke(
+    usage: &BTreeMap<QualifiedId<FunId>, UsageState>,
+    code: &[Bytecode],
+    temp: TempIndex,
+) -> bool {
+    code.iter().any(|bc| match bc {
+        Bytecode::Call(_, dests, Operation::Closure(mid, fid, _, _), _, _) => {
+            dests.contains(&temp)
+                && usage
+                    .get(&mid.qualified(*fid))
+                    .is_some_and(|target_usage| target_usage.unbounded_invoke)
+        },
+        _ => false,
+    })
+}
+
+/// Footprints of the closures in `code` bound to a temporary defined once, keyed by that
+/// temporary.
+fn closure_footprints(
+    env: &GlobalEnv,
+    enclosing: QualifiedId<FunId>,
+    usage: &BTreeMap<QualifiedId<FunId>, UsageState>,
+    code: &[Bytecode],
+) -> BTreeMap<TempIndex, ClosureFootprint> {
+    // A loop head havocs every temporary the body assigns, a closure among them, so a
+    // closure built inside a loop has two definitions and no footprint here. That is
+    // deliberate: the call-site havoc derived from a footprint covers the path through the
+    // loop body, but a claim made after the loop is checked against the loop-exit path,
+    // whose memory havoc comes from the callee's usage summary -- empty for a callee that
+    // declares no frame. Treating the footprint as known there would let a false post-loop
+    // claim through, so the loop case is left without one and rejected instead.
+    let mut def_counts: BTreeMap<TempIndex, usize> = BTreeMap::new();
+    for bc in code {
+        for dest in bc.dests() {
+            *def_counts.entry(dest).or_default() += 1;
+        }
+    }
+    let summary_of = |id: QualifiedId<FunId>| usage.get(&id).cloned();
+    let known = usage_analysis::closures_with_known_footprint(env, enclosing, code, &summary_of);
+    code.iter()
+        .filter_map(|bc| match bc {
+            Bytecode::Call(_, dests, Operation::Closure(mid, fid, targs, _), _, _)
+                if dests.len() == 1 && def_counts[&dests[0]] == 1 =>
+            {
+                let target_usage = usage.get(&mid.qualified(*fid))?;
+                let code_writes = target_usage.modified.get_all_inst(targs);
+                let mut writes = code_writes.clone();
+                writes.extend(target_usage.invoke_frame.get_all_inst(targs));
+                let effects = known.get(&dests[0]);
+                if let Some(effects) = effects {
+                    writes.extend(effects.writes.iter().cloned());
+                }
+                let code_accessed = target_usage
+                    .code_accessed
+                    .iter()
+                    .map(|mem| mem.instantiate_ref(targs))
+                    .collect();
+                Some((dests[0], ClosureFootprint {
+                    writes,
+                    known: effects.is_some(),
+                    code_writes,
+                    code_accessed,
+                }))
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `modifies_of`/`reads_of` frame a function declares for a function-typed parameter,
+/// instantiated at a call site.
+///
+/// Without a declaration the parameter may access no memory, except where the callee
+/// leaves the frame to its call sites (`FunctionEnv::leaves_fun_param_frame_to_call_site`).
+#[derive(Default)]
+struct DeclaredFrame {
+    writes: BTreeSet<QualifiedInstId<StructId>>,
+    accessed: BTreeSet<QualifiedInstId<StructId>>,
+    modifies_all: bool,
+    reads_all: bool,
+}
+
+impl DeclaredFrame {
+    fn of_fun_param(fun_env: &FunctionEnv, param: Symbol, targs: &[Type]) -> Self {
+        let param_access = fun_env.get_fun_param_access_of();
+        let Some(access) = param_access.iter().find(|a| a.fun_param == param) else {
+            return Self::default();
+        };
+        let inst = |mems: &BTreeSet<QualifiedInstId<StructId>>| {
+            mems.iter()
+                .map(|mem| mem.instantiate_ref(targs))
+                .collect::<BTreeSet<_>>()
+        };
+        Self {
+            writes: inst(&access.old_memory),
+            accessed: inst(&access.used_memory),
+            modifies_all: access.frame_spec.modifies_all,
+            reads_all: access.frame_spec.reads_all,
+        }
+    }
+}
+
+/// Checks that a closure passed to an opaque function stays within the frame the callee
+/// declares for the parameter. The callee is verified under that frame, and its callers
+/// assume the result. The closure is judged by what its code accesses; frames of function
+/// values it invokes are not included.
+///
+/// A callee that leaves the frame to its call sites
+/// (`FunctionEnv::leaves_fun_param_frame_to_call_site`) is the exception: the call site
+/// supplies the frame instead, provided it has a closure footprint to supply, and the
+/// usage analysis carries that footprint into the summary of the function making the call.
+fn check_fun_arg_frames(
+    env: &GlobalEnv,
+    targets: &FunctionTargetsHolder,
+    usage: &BTreeMap<QualifiedId<FunId>, UsageState>,
+) {
+    for module_env in env.get_modules().filter(|m| m.is_target()) {
+        for fun_env in module_env.get_functions() {
+            if fun_env.is_not_prover_target()
+                || !fun_env.is_compiled()
+                || fun_env.is_native()
+                || fun_env.is_intrinsic()
+            {
+                continue;
+            }
+            let target = targets.get_target(&fun_env, &FunctionVariant::Baseline);
+            let footprints = closure_footprints(
+                env,
+                fun_env.get_qualified_id(),
+                usage,
+                target.get_bytecode(),
+            );
+            for bc in target.get_bytecode() {
+                let Bytecode::Call(id, _, Operation::Function(mid, fid, targs), srcs, _) = bc
+                else {
+                    continue;
+                };
+                let callee_env = env.get_module(*mid).into_function(*fid);
+                if !callee_env.is_opaque() {
+                    continue;
+                }
+                for (param, src) in callee_env.get_parameters().iter().zip(srcs) {
+                    let frame = DeclaredFrame::of_fun_param(&callee_env, param.0, targs);
+                    if frame.modifies_all {
+                        continue;
+                    }
+                    let defers = callee_env.leaves_fun_param_frame_to_call_site(param.0);
+                    let loc = target.get_bytecode_loc(*id);
+                    let param_name = param.0.display(env.symbol_pool());
+                    // A closure built here whose target runs a function value nothing bounds
+                    // has writes no footprint records, so it can be checked against neither
+                    // a declared frame nor a deferred one.
+                    if param.1.skip_reference().is_function()
+                        && closure_target_has_unbounded_invoke(usage, target.get_bytecode(), *src)
+                    {
+                        env.error(
+                            &loc,
+                            &format!(
+                                "cannot establish what function argument `{}` may modify: \
+                                 the closure's target invokes a function value whose effects \
+                                 no `modifies_of` declaration bounds",
+                                param_name
+                            ),
+                        );
+                        continue;
+                    }
+                    let Some(footprint) = footprints.get(src).filter(|f| f.known) else {
+                        // Deferring only works when this call site can answer the question
+                        // the callee left open: for a closure whose writes are known
+                        // (`closures_with_known_footprint`), which are then havoced across
+                        // the call. Any other function value -- a forwarded parameter, a
+                        // stored callback, a closure over this very function, or one that
+                        // partially applies another deferring callee -- has no footprint to
+                        // havoc, so the callee's empty frame stands and the argument has to
+                        // be rejected rather than waved through.
+                        //
+                        // Against a declared frame, a closure built once here whose effects
+                        // are not known cannot be shown to stay within it either.
+                        if !defers
+                            && param.1.skip_reference().is_function()
+                            && footprints.contains_key(src)
+                        {
+                            env.error(
+                                &loc,
+                                &format!(
+                                    "cannot establish what function argument `{}` may \
+                                     modify: the closure's effects are not known",
+                                    param_name
+                                ),
+                            );
+                        } else if defers && param.1.skip_reference().is_function() {
+                            env.error(
+                                &loc,
+                                &format!(
+                                    "cannot establish what function argument `{}` may \
+                                     modify: `{}` declares no `modifies_of` for it, and the \
+                                     argument is not a closure with a known footprint built \
+                                     at this call site",
+                                    param_name,
+                                    callee_env.get_full_name_str()
+                                ),
+                            );
+                        }
+                        continue;
+                    };
+                    if defers {
+                        continue;
+                    }
+                    for mem in footprint.code_writes.difference(&frame.writes) {
+                        env.error(
+                            &loc,
+                            &format!(
+                                "function argument may modify resource `{}`, which is not \
+                                 declared in `modifies_of` for `{}`",
+                                env.display(mem),
+                                param_name
+                            ),
+                        );
+                    }
+                    if frame.reads_all {
+                        continue;
+                    }
+                    for mem in footprint
+                        .code_accessed
+                        .difference(&frame.accessed)
+                        .filter(|mem| !footprint.code_writes.contains(mem))
+                    {
+                        env.error(
+                            &loc,
+                            &format!(
+                                "function argument accesses resource `{}`, which is not \
+                                 declared in `modifies_of`/`reads_of` for `{}`",
+                                env.display(mem),
+                                param_name
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn check_modifies(env: &GlobalEnv, targets: &FunctionTargetsHolder) {
     let mut warned_coarse_callees = BTreeSet::new();
     for module_env in env.get_modules() {

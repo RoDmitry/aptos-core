@@ -1,12 +1,12 @@
 // Copyright (c) Aptos Foundation
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
-use super::common::{call_block_function, serialize, system_txn_outcome, SystemTxnMetadata};
+use super::common::{
+    call_block_function, discard_system_session, system_txn_outcome, SystemTxnMetadata,
+};
 use crate::{errors::NoEffectsReason, executor::AptosTransactionExecutor, outcome::TxnOutcome};
 use aptos_types::transaction::{BlockEpiloguePayload, FeeDistribution};
-use move_core_types::{ident_str, identifier::IdentStr};
-
-const BLOCK_EPILOGUE: &IdentStr = ident_str!("block_epilogue");
+use move_value_view::IterAsMoveVector;
 
 impl<'guard> AptosTransactionExecutor<'guard> {
     /// Executes a block-epilogue (system) transaction.
@@ -21,7 +21,7 @@ impl<'guard> AptosTransactionExecutor<'guard> {
     pub fn execute_block_epilogue_transaction(
         &self,
         block_epilogue: &BlockEpiloguePayload,
-    ) -> TxnOutcome<'guard> {
+    ) -> TxnOutcome {
         let fee_distribution = match block_epilogue {
             // V0 carries no fee distribution: nothing runs on-chain.
             BlockEpiloguePayload::V0 { .. } => {
@@ -35,22 +35,26 @@ impl<'guard> AptosTransactionExecutor<'guard> {
             } => fee_distribution,
         };
         let FeeDistribution::V0 { amount } = fee_distribution;
-        let (validator_indices, amounts): (Vec<u64>, Vec<u64>) = amount
-            .iter()
-            .map(|(index, amount)| (*index, *amount))
-            .unzip();
-        let args = match (serialize(&validator_indices), serialize(&amounts)) {
-            (Ok(validator_indices), Ok(amounts)) => [validator_indices, amounts],
-            (Err(failure), _) | (_, Err(failure)) => {
-                return TxnOutcome::ExecutedNoEffects(NoEffectsReason::BlockEpilogueFailed(failure))
-            },
-        };
         let txn_data = SystemTxnMetadata::for_block_epilogue(block_epilogue);
         let mut interp = self.system_session(&txn_data);
-        match call_block_function(&mut interp, self.guard, BLOCK_EPILOGUE, &args) {
+        let result = call_block_function(
+            &mut interp,
+            self.symbols,
+            self.symbols.block_epilogue,
+            |call| {
+                call.arg(&IterAsMoveVector(amount.keys().copied()))?;
+                call.arg(&IterAsMoveVector(amount.values().copied()))
+            },
+        );
+        match result {
             Ok(()) => system_txn_outcome(interp),
-            Err(failure) => {
-                TxnOutcome::ExecutedNoEffects(NoEffectsReason::BlockEpilogueFailed(failure))
+            Err(failure) => match discard_system_session(interp) {
+                Ok(()) => {
+                    TxnOutcome::ExecutedNoEffects(NoEffectsReason::BlockEpilogueFailed(failure))
+                },
+                // The epilogue's own failure is absorbed, but a VM error while
+                // closing the session is not: nothing else would report it.
+                Err(e) => TxnOutcome::Panic(e),
             },
         }
     }

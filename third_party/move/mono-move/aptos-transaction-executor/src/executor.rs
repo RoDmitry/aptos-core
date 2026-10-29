@@ -4,13 +4,14 @@
 use crate::{
     errors::{DiscardReason, NoEffectsReason},
     outcome::TxnOutcome,
+    providers::AptosDataProvider,
 };
 use aptos_types::{
     state_store::state_storage_usage::StateStorageUsage,
     transaction::{AuxiliaryInfo, Transaction},
 };
 use aptos_vm_environment::environment::AptosEnvironment;
-use mono_move_core::{storage::module_provider::ModuleProvider, ResourceProvider};
+use mono_move_core::{storage::module_provider::ModuleProvider, FrameworkSymbols};
 use mono_move_global_context::ExecutionGuard;
 use mono_move_runtime::ProductionNativeRegistry;
 
@@ -22,11 +23,12 @@ use mono_move_runtime::ProductionNativeRegistry;
 /// `system_txns`.
 pub struct AptosTransactionExecutor<'a> {
     pub(crate) guard: &'a ExecutionGuard<'a>,
-    // TODO(cleanup): We are considering moving the native registry into the GlobalContext.
-    // This parameter may disappear once it moves there.
+    /// The framework symbols interned once into `guard`'s context.
+    pub(crate) symbols: &'a FrameworkSymbols,
+    /// All native functions available for this executor.
     pub(crate) natives: &'a ProductionNativeRegistry,
     pub(crate) module_provider: &'a dyn ModuleProvider,
-    pub(crate) data_provider: &'a dyn ResourceProvider,
+    pub(crate) data_provider: &'a dyn AptosDataProvider,
     /// The on-chain configs (features, gas schedule) at the current state.
     //
     // TODO(cleanup): reusing the legacy VM's environment type is transitional;
@@ -47,12 +49,13 @@ impl<'a> AptosTransactionExecutor<'a> {
         guard: &'a ExecutionGuard<'a>,
         natives: &'a ProductionNativeRegistry,
         module_provider: &'a dyn ModuleProvider,
-        data_provider: &'a dyn ResourceProvider,
+        data_provider: &'a dyn AptosDataProvider,
         env: &'a AptosEnvironment,
         usage: StateStorageUsage,
     ) -> Self {
         Self {
             guard,
+            symbols: guard.framework_symbols(),
             natives,
             module_provider,
             data_provider,
@@ -74,11 +77,7 @@ impl<'a> AptosTransactionExecutor<'a> {
     //
     // TODO(completeness): genesis and validator transactions; some may stay
     // the block coordinator's job.
-    pub fn execute_transaction(
-        &self,
-        txn: &Transaction,
-        aux_info: &AuxiliaryInfo,
-    ) -> TxnOutcome<'a> {
+    pub fn execute_transaction(&self, txn: &Transaction, aux_info: &AuxiliaryInfo) -> TxnOutcome {
         match txn {
             Transaction::UserTransaction(txn) => self.execute_user_transaction(txn, aux_info),
             Transaction::BlockMetadata(block_metadata) => {
@@ -90,16 +89,18 @@ impl<'a> AptosTransactionExecutor<'a> {
             Transaction::BlockEpilogue(block_epilogue) => {
                 self.execute_block_epilogue_transaction(block_epilogue)
             },
-            Transaction::GenesisTransaction(_) => {
-                TxnOutcome::Discarded(DiscardReason::Unsupported("genesis transactions"))
+            Transaction::GenesisTransaction(_) => TxnOutcome::Discarded {
+                reason: DiscardReason::Unsupported("genesis transactions"),
+                effects: None,
             },
             // A state checkpoint runs nothing on-chain; it only marks a point
             // for the executor to checkpoint the state tree at.
             Transaction::StateCheckpoint(_) => {
                 TxnOutcome::ExecutedNoEffects(NoEffectsReason::NothingToExecute)
             },
-            Transaction::ValidatorTransaction(_) => {
-                TxnOutcome::Discarded(DiscardReason::Unsupported("validator transactions"))
+            Transaction::ValidatorTransaction(_) => TxnOutcome::Discarded {
+                reason: DiscardReason::Unsupported("validator transactions"),
+                effects: None,
             },
         }
     }

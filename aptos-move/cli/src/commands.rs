@@ -64,6 +64,7 @@ use colored::Colorize;
 use itertools::Itertools;
 use move_binary_format::file_format_common::{write_u64_as_uleb128, BinaryData};
 use move_command_line_common::{address::NumericalAddress, env::MOVE_HOME};
+use move_compiler_v2::Experiment;
 use move_core_types::{
     identifier::Identifier,
     int256::{I256, U256},
@@ -748,6 +749,15 @@ impl CliCommand<&'static str> for ProvePackage {
 /// `masm%`/`move%` elaborators): processes one masm file resp. one
 /// self-contained Move module and writes the JSON to `--out-file` (or
 /// stdout is not used to keep it free for the CLI result).
+/// The exchange format produced by [`ExchangePackage`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExchangeFormat {
+    /// Stackless bytecode CFGs with contracts (`*.exchange.json`).
+    Xir,
+    /// The typed AST with specifications (`*.xast.json`).
+    Ast,
+}
+
 #[derive(Parser)]
 #[clap(group(clap::ArgGroup::new("single_file")
     .multiple(false)
@@ -761,6 +771,23 @@ pub struct ExchangePackage {
     /// to `exchange-json` under the package path)
     #[clap(long, value_parser, conflicts_with = "single_file")]
     export_dir: Option<PathBuf>,
+
+    /// The exchange format to produce: `xir` (stackless bytecode with
+    /// contracts, the default) or `ast` (the typed AST with specifications,
+    /// for source-level consumers such as the Lean transpiler)
+    #[clap(long, value_enum, default_value_t = ExchangeFormat::Xir)]
+    format: ExchangeFormat,
+
+    /// In package mode, also export the dependency modules (with source),
+    /// so the export is closed under imports
+    #[clap(long, conflicts_with = "single_file")]
+    include_deps: bool,
+
+    /// In package mode, export only these modules (`module`,
+    /// `address::module`, or `alias::module`, comma-separated) and the
+    /// modules verifying them reads, dependencies included
+    #[clap(long, value_delimiter = ',', conflicts_with = "single_file")]
+    modules: Vec<String>,
 
     /// A single masm file to export (instead of a package)
     #[clap(long, value_parser)]
@@ -816,6 +843,121 @@ mod exchange_flag_tests {
     }
 }
 
+/// Exports the modules of a package in the given exchange format into
+/// `out_dir`, one JSON file per module; the number exported. With `modules`,
+/// exports those and the modules verifying them reads instead.
+fn export_package(
+    move_options: &MovePackageOptions,
+    out_dir: &Path,
+    format: ExchangeFormat,
+    include_deps: bool,
+    modules: &[String],
+) -> CliTypedResult<usize> {
+    let package_path = move_options.get_package_path()?;
+    let compiler_version = move_options
+        .compiler_version
+        .or_else(|| Some(CompilerVersion::latest_stable()));
+    let language_version = move_options
+        .language_version
+        .or_else(|| Some(LanguageVersion::latest_stable()));
+    // The XIR export needs the full pipeline (it lifts bytecode to
+    // stackless form); the AST export stops after the checker and
+    // rewriters, before AST optimization, so the exported AST keeps
+    // its source shape.
+    let with_bytecode = format == ExchangeFormat::Xir;
+    // The specification rewriter resolves Move functions called in
+    // specifications to their derived spec-function companions; the
+    // full pipeline runs it anyway, the AST export needs it asked for.
+    let experiments = vec![format!("{}=on", Experiment::SPEC_REWRITE)];
+    let model = build_model(
+        move_options.dev,
+        false, // test_mode
+        true,  // verify_mode
+        package_path.as_path(),
+        move_options.named_addresses(),
+        None,
+        fix_bytecode_version(move_options.bytecode_version, language_version),
+        compiler_version,
+        language_version,
+        move_options.skip_attribute_checks,
+        extended_checks::get_all_attribute_names().clone(),
+        experiments,
+        with_bytecode,
+        // A dependency exported with its source goes through the full
+        // pipeline a target gets, so its inlined and rewritten form is what
+        // the export carries.
+        include_deps || !modules.is_empty(),
+    )
+    .map_err(|e| CliError::MoveCompilationError(format!("{:#}", e)))?;
+    model
+        .check_errors("in compilation")
+        .map_err(|e| CliError::MoveCompilationError(format!("{:#}", e)))?;
+    let selection = if modules.is_empty() {
+        None
+    } else {
+        let selected = exchange::select_modules(&model, modules)
+            .map_err(|e| CliError::CommandArgumentError(format!("{:#}", e)))?;
+        Some(exchange::module_closure(&model, &selected))
+    };
+    std::fs::create_dir_all(out_dir).map_err(|e| CliError::IO(out_dir.display().to_string(), e))?;
+    let suffix = match format {
+        ExchangeFormat::Xir => ".exchange.json",
+        ExchangeFormat::Ast => ".xast.json",
+    };
+    // Remove the artifacts of previous runs, so that renamed or
+    // removed modules do not leave stale exports behind.
+    for entry in
+        std::fs::read_dir(out_dir).map_err(|e| CliError::IO(out_dir.display().to_string(), e))?
+    {
+        let path = entry
+            .map_err(|e| CliError::IO(out_dir.display().to_string(), e))?
+            .path();
+        if path.to_string_lossy().ends_with(suffix) {
+            std::fs::remove_file(&path).map_err(|e| CliError::IO(path.display().to_string(), e))?;
+        }
+    }
+    let mut exported = 0usize;
+    for module in model.get_modules() {
+        // Dependencies are exported on request, and only when their
+        // source is available (a bytecode-only dependency has no AST).
+        let wanted = match &selection {
+            Some(selection) => {
+                selection.contains(&module.get_id()) && !module.get_source_path().is_empty()
+            },
+            None => module.is_target() || include_deps && !module.get_source_path().is_empty(),
+        };
+        if !wanted {
+            continue;
+        }
+        let name = module.get_full_name_str().replace("::", "_");
+        let dumped = match format {
+            ExchangeFormat::Xir => exchange::dump_module_from_model(&model, module.get_id())
+                .map(|m| m.to_pretty_json()),
+            ExchangeFormat::Ast => {
+                exchange::dump_ast_module(&model, module.get_id()).map(|m| m.to_pretty_json())
+            },
+        };
+        match dumped {
+            Ok(text) => {
+                let path = out_dir.join(format!("{}{}", name, suffix));
+                let mut tmp = tempfile::NamedTempFile::new_in(out_dir)
+                    .map_err(|e| CliError::IO(out_dir.display().to_string(), e))?;
+                tmp.write_all((text + "\n").as_bytes())
+                    .map_err(|e| CliError::IO(path.display().to_string(), e))?;
+                tmp.persist_noclobber(&path)
+                    .map_err(|e| CliError::IO(path.display().to_string(), e.error))?;
+                exported += 1;
+            },
+            Err(e) => eprintln!(
+                "warning: skipping module `{}`: {:#}",
+                module.get_full_name_str(),
+                e
+            ),
+        }
+    }
+    Ok(exported)
+}
+
 #[async_trait]
 impl CliCommand<&'static str> for ExchangePackage {
     fn command_name(&self) -> &'static str {
@@ -826,6 +968,9 @@ impl CliCommand<&'static str> for ExchangePackage {
         let ExchangePackage {
             move_options,
             export_dir,
+            format,
+            include_deps,
+            modules,
             masm_file,
             move_file,
             out_file,
@@ -841,15 +986,27 @@ impl CliCommand<&'static str> for ExchangePackage {
                     (None, Some(p)) => (p, true),
                     _ => unreachable!("clap enforces exclusivity"),
                 };
-                let module = if is_move {
-                    exchange::move_file_to_module(path)
-                } else {
-                    let input = std::fs::read_to_string(path)
-                        .map_err(|e| CliError::IO(path.display().to_string(), e))?;
-                    exchange::masm_to_module(&input)
+                let text = match (format, is_move) {
+                    (ExchangeFormat::Ast, true) => exchange::move_file_to_ast(path).map(|module| {
+                        serde_json::to_string(&module).expect("serialization succeeds")
+                    }),
+                    (ExchangeFormat::Ast, false) => Err(anyhow::anyhow!(
+                        "the `ast` format exports Move source, not masm (use --move-file)"
+                    )),
+                    (ExchangeFormat::Xir, true) => {
+                        exchange::move_file_to_module(path).map(|module| {
+                            serde_json::to_string(&module).expect("serialization succeeds")
+                        })
+                    },
+                    (ExchangeFormat::Xir, false) => {
+                        let input = std::fs::read_to_string(path)
+                            .map_err(|e| CliError::IO(path.display().to_string(), e))?;
+                        exchange::masm_to_module(&input).map(|module| {
+                            serde_json::to_string(&module).expect("serialization succeeds")
+                        })
+                    },
                 }
                 .map_err(|e| CliError::MoveCompilationError(format!("{:#}", e)))?;
-                let text = serde_json::to_string(&module).expect("serialization succeeds");
                 std::fs::write(&out_file, text)
                     .map_err(|e| CliError::IO(out_file.display().to_string(), e))?;
                 Ok("Success")
@@ -857,75 +1014,10 @@ impl CliCommand<&'static str> for ExchangePackage {
             .await
             .map_err(|err| CliError::UnexpectedError(err.to_string()))?;
         }
-        let compiler_version = move_options
-            .compiler_version
-            .or_else(|| Some(CompilerVersion::latest_stable()));
-        let language_version = move_options
-            .language_version
-            .or_else(|| Some(LanguageVersion::latest_stable()));
         task::spawn_blocking(move || {
             let package_path = move_options.get_package_path()?;
             let out_dir = export_dir.unwrap_or_else(|| package_path.join("exchange-json"));
-            let model = build_model(
-                move_options.dev,
-                false, // test_mode
-                true,  // verify_mode
-                package_path.as_path(),
-                move_options.named_addresses(),
-                None,
-                fix_bytecode_version(move_options.bytecode_version, language_version),
-                compiler_version,
-                language_version,
-                move_options.skip_attribute_checks,
-                extended_checks::get_all_attribute_names().clone(),
-                vec![],
-                true,  // with_bytecode
-                false, // all_files_as_targets
-            )
-            .map_err(|e| CliError::MoveCompilationError(format!("{:#}", e)))?;
-            model
-                .check_errors("in compilation")
-                .map_err(|e| CliError::MoveCompilationError(format!("{:#}", e)))?;
-            std::fs::create_dir_all(&out_dir)
-                .map_err(|e| CliError::IO(out_dir.display().to_string(), e))?;
-            // Remove the artifacts of previous runs, so that renamed or
-            // removed modules do not leave stale exports behind.
-            for entry in std::fs::read_dir(&out_dir)
-                .map_err(|e| CliError::IO(out_dir.display().to_string(), e))?
-            {
-                let path = entry
-                    .map_err(|e| CliError::IO(out_dir.display().to_string(), e))?
-                    .path();
-                if path.to_string_lossy().ends_with(".exchange.json") {
-                    std::fs::remove_file(&path)
-                        .map_err(|e| CliError::IO(path.display().to_string(), e))?;
-                }
-            }
-            let mut exported = 0usize;
-            for module in model.get_modules() {
-                if !module.is_target() {
-                    continue;
-                }
-                let name = module.get_full_name_str().replace("::", "_");
-                match exchange::dump_module_from_model(&model, module.get_id()) {
-                    Ok(module) => {
-                        let path = out_dir.join(format!("{}.exchange.json", name));
-                        let text = module.to_pretty_json();
-                        let mut tmp = tempfile::NamedTempFile::new_in(&out_dir)
-                            .map_err(|e| CliError::IO(out_dir.display().to_string(), e))?;
-                        tmp.write_all((text + "\n").as_bytes())
-                            .map_err(|e| CliError::IO(path.display().to_string(), e))?;
-                        tmp.persist_noclobber(&path)
-                            .map_err(|e| CliError::IO(path.display().to_string(), e.error))?;
-                        exported += 1;
-                    },
-                    Err(e) => eprintln!(
-                        "warning: skipping module `{}`: {:#}",
-                        module.get_full_name_str(),
-                        e
-                    ),
-                }
-            }
+            let exported = export_package(&move_options, &out_dir, format, include_deps, &modules)?;
             println!("Exported {} module(s) to {}", exported, out_dir.display());
             Ok("Success")
         })
@@ -1286,7 +1378,7 @@ impl CliCommand<TransactionSummary> for PublishPackage {
         if self.chunked_publish_option.chunked_publish {
             let chunked_package_payloads: ChunkedPublishPayloads = (&self).async_try_into().await?;
 
-            let message = format!("Publishing package in chunked mode will submit {} transactions for staging and publishing code.\n", &chunked_package_payloads.payloads.len());
+            let message = format!("Publishing package in chunked mode will submit {} transactions for staging and publishing code.\n", chunked_package_payloads.payloads.len());
             println!("{}", message.bold());
             submit_chunked_publish_transactions(
                 chunked_package_payloads.payloads,
@@ -1466,7 +1558,7 @@ impl CliCommand<TransactionSummary> for CreateObjectAndPublishPackage {
                 .map(bcs::serialized_size)
                 .sum::<Result<usize, _>>()?;
             println!("package size {} bytes", size);
-            let message = format!("Publishing package in chunked mode will submit {} transactions for staging and publishing code.\n", &payloads.len());
+            let message = format!("Publishing package in chunked mode will submit {} transactions for staging and publishing code.\n", payloads.len());
             println!("{}", message.bold());
 
             submit_chunked_publish_transactions(
@@ -1585,7 +1677,7 @@ impl CliCommand<TransactionSummary> for UpgradeObjectPackage {
                 .map(bcs::serialized_size)
                 .sum::<Result<usize, _>>()?;
             println!("package size {} bytes", size);
-            let message = format!("Upgrading package in chunked mode will submit {} transactions for staging and upgrading code.\n", &payloads.len());
+            let message = format!("Upgrading package in chunked mode will submit {} transactions for staging and upgrading code.\n", payloads.len());
             println!("{}", message.bold());
             submit_chunked_publish_transactions(
                 payloads,
@@ -1725,7 +1817,7 @@ impl CliCommand<TransactionSummary> for DeployObjectCode {
                 .map(bcs::serialized_size)
                 .sum::<Result<usize, _>>()?;
             println!("package size {} bytes", size);
-            let message = format!("Publishing package in chunked mode will submit {} transactions for staging and publishing code.\n", &payloads.len());
+            let message = format!("Publishing package in chunked mode will submit {} transactions for staging and publishing code.\n", payloads.len());
             println!("{}", message.bold());
 
             submit_chunked_publish_transactions(
@@ -1889,7 +1981,7 @@ impl CliCommand<TransactionSummary> for UpgradeCodeObject {
                 .map(bcs::serialized_size)
                 .sum::<Result<usize, _>>()?;
             println!("package size {} bytes", size);
-            let message = format!("Upgrading package in chunked mode will submit {} transactions for staging and upgrading code.\n", &payloads.len());
+            let message = format!("Upgrading package in chunked mode will submit {} transactions for staging and upgrading code.\n", payloads.len());
             println!("{}", message.bold());
             submit_chunked_publish_transactions(
                 payloads,
@@ -1982,7 +2074,7 @@ async fn submit_chunked_publish_transactions(
                         "Failed".to_string()
                     }
                 });
-                println!("Transaction executed: {} ({})\n", status, &tx_hash);
+                println!("Transaction executed: {} ({})\n", status, tx_hash);
                 tx_hashes.push(tx_hash);
                 publishing_result = Ok(tx_summary);
             },
@@ -2097,7 +2189,7 @@ impl CliCommand<TransactionSummary> for ClearStagingArea {
             .await?;
         println!(
             "Cleaning up resource {}::large_packages::StagingArea under account {}.",
-            &large_packages_module_address, account_address,
+            large_packages_module_address, account_address,
         );
         let payload = large_packages_cleanup_staging_area(large_packages_module_address);
         dispatch_transaction(payload, &self.txn_options, &self.env).await

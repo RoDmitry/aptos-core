@@ -4,11 +4,12 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    position_db::{PositionDb, NUM_NATIVE_VALUE_SHARDS},
+    native_state_store::{position_key_of, PositionWrites},
+    native_store::kv_db::{PositionDb, NUM_NATIVE_VALUE_SHARDS},
     position_metrics::POSITION_WRITES,
     schema::{
-        position_value::PositionValueSchema,
-        stale_position_value_index::{StalePositionValueIndex, StalePositionValueIndexSchema},
+        native_stale_value_index::{NativeStaleValueIndex, NativeStaleValueIndexSchema},
+        native_value::NativeValueSchema,
     },
     sharded_kv_db::ShardedKvDb,
 };
@@ -16,29 +17,11 @@ use aptos_crypto::{hash::CryptoHash, HashValue};
 use aptos_schemadb::batch::SchemaBatch;
 use aptos_storage_interface::{AptosDbError, Result};
 use aptos_types::{
-    state_store::{
-        state_key::{
-            inner::{StateKeyInner, TradingNativeKey},
-            StateKey,
-        },
-        state_value::StateValue,
-    },
+    state_store::{native_position::NativePosition, state_key::StateKey},
     transaction::Version,
     write_set::WriteOp,
 };
 use std::{collections::HashMap, sync::Arc};
-
-#[derive(Clone, Debug)]
-pub struct MerkleLeafUpdate {
-    pub state_key_hash: HashValue,
-    pub state_key: StateKey,
-    pub value_hash: Option<HashValue>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct NativeMerkleLeafUpdates {
-    pub position: Vec<MerkleLeafUpdate>,
-}
 
 /// Per-chunk batches accumulated by `NativeStateCommitter::apply`.
 /// Allocate once per chunk, drive `apply` per transaction, then
@@ -58,33 +41,26 @@ pub struct NativeStateCommitter {
 }
 
 impl NativeStateCommitter {
-    pub fn new(position_db: Arc<PositionDb>) -> Self {
+    pub(crate) fn new(position_db: Arc<PositionDb>) -> Self {
         Self { position_db }
     }
 
-    /// Accumulate one transaction's Position writes into the
-    /// per-chunk batches. The caller commits once per chunk via
-    /// `PositionDb::commit`.
+    /// Accumulate one transaction's Position writes into the per-chunk
+    /// kv batches and emit them decoded for the caller to extend the
+    /// overlay with.
     pub fn apply<P>(
         &self,
         version: Version,
         position_writes: P,
         sharded_kv_batches: &mut PositionShardedKvBatches,
         in_chunk_prior: &mut InChunkPriorVersions,
-    ) -> Result<NativeMerkleLeafUpdates>
+    ) -> Result<PositionWrites>
     where
         P: IntoIterator<Item = (StateKey, WriteOp)>,
     {
-        let mut position_merkle: Vec<MerkleLeafUpdate> = Vec::new();
+        let mut decoded = PositionWrites::new();
         for (state_key, op) in position_writes {
-            match state_key.inner() {
-                StateKeyInner::TradingNative(TradingNativeKey::Position { .. }) => (),
-                other => {
-                    return Err(AptosDbError::Other(format!(
-                        "position_write_set contained non-Position StateKey: {other:?}"
-                    )));
-                },
-            };
+            let position_key = position_key_of(&state_key)?;
             let maybe_value = op.as_state_value_opt().cloned();
             let kind_label = if maybe_value.is_some() {
                 "upsert"
@@ -109,33 +85,36 @@ impl NativeStateCommitter {
             // `is_first_write()`. Lets truncation iterate this CF
             // alone to reach every kv row.
             pos_batch
-                .put::<StalePositionValueIndexSchema>(
-                    &StalePositionValueIndex {
+                .put::<NativeStaleValueIndexSchema>(
+                    &NativeStaleValueIndex {
                         stale_since_version: version,
-                        version: prior_v.unwrap_or(StalePositionValueIndex::NO_PREV_VERSION),
+                        version: prior_v.unwrap_or(NativeStaleValueIndex::NO_PREV_VERSION),
                         state_key_hash,
                     },
                     &(),
                 )
                 .map_err(|e| AptosDbError::Other(format!("stale_position_value_index put: {e}")))?;
             pos_batch
-                .put::<PositionValueSchema>(&(state_key_hash, version), &maybe_value)
+                .put::<NativeValueSchema>(&(state_key_hash, version), &maybe_value)
                 .map_err(|e| {
                     AptosDbError::Other(format!("position_value batch put failed: {e}"))
                 })?;
 
             in_chunk_prior.insert(state_key_hash, version);
 
-            let value_hash = maybe_value.as_ref().map(StateValue::hash);
-            position_merkle.push(MerkleLeafUpdate {
-                state_key_hash,
-                state_key: state_key.clone(),
-                value_hash,
-            });
+            // Decode once: the caller extends the overlay with this and
+            // validator-side readers consume decoded values.
+            let typed = match maybe_value.as_ref() {
+                Some(sv) => Some(NativePosition::deserialize(sv.bytes()).map_err(|e| {
+                    AptosDbError::Other(format!(
+                        "position value at version {version} failed to decode: {e}"
+                    ))
+                })?),
+                None => None,
+            };
+            decoded.push((position_key, typed));
         }
 
-        Ok(NativeMerkleLeafUpdates {
-            position: position_merkle,
-        })
+        Ok(decoded)
     }
 }

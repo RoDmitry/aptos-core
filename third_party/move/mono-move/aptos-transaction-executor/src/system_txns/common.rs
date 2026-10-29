@@ -4,28 +4,29 @@
 //! Common utilities shared by all system transactions.
 
 use crate::{
-    calls::{call_system_function_unmetered, into_result, invariant_violation},
-    errors::{ExecutionStatus, MoveExecutionFailure},
+    calls::call_system_function_unmetered,
+    errors::{call_result, ExecutionStatus, MoveExecutionFailure},
     executor::AptosTransactionExecutor,
     natives::extensions_with,
     outcome::TxnOutcome,
 };
-use anyhow::anyhow;
 use aptos_types::{
     block_metadata::BlockMetadata,
     block_metadata_ext::BlockMetadataExt,
     fee_statement::FeeStatement,
     transaction::{BlockEpiloguePayload, SessionId},
 };
-use mono_move_core::{GasMeter, Interner};
-use mono_move_global_context::ExecutionGuard;
+use mono_move_core::{
+    interner::InternedIdentifier, types::EMPTY_TYPE_LIST, FrameworkSymbols, GasMeter,
+    VMInternalError,
+};
 use mono_move_loader::{Loader, LoadingPolicy, LoweringPolicy};
 use mono_move_natives::TransactionContextExtension;
-use mono_move_runtime::InterpreterContext;
-use move_core_types::{account_address::AccountAddress, ident_str, identifier::IdentStr};
-use serde::Serialize;
+use mono_move_runtime::{CallBuilder, InterpreterContext};
+use move_core_types::account_address::AccountAddress;
 
-const BLOCK: &IdentStr = ident_str!("block");
+/// The VM's signer (`0x0`), which every `0x1::block` call runs as.
+pub(super) const VM_SIGNER: AccountAddress = AccountAddress::ZERO;
 
 /// A system transaction's session identity: what seeds its transaction
 /// context in place of user-transaction metadata.
@@ -89,44 +90,51 @@ impl<'a> AptosTransactionExecutor<'a> {
         // is supposed to run through `call_system_function_unmetered`, which
         // grants free execution, and in case it is not and anything accidentally
         // gets metered, it fails on the first charge.
-        InterpreterContext::new_idle(loader, GasMeter::new(0), self.data_provider, self.natives)
+        InterpreterContext::new(loader, GasMeter::new(0), self.data_provider, self.natives)
             .with_extensions(extensions_with(txn_context, self.usage))
     }
 }
 
 /// The outcome of a completed system transaction: fee-free and successful.
-pub(super) fn system_txn_outcome<'guard>(interp: InterpreterContext<'guard>) -> TxnOutcome<'guard> {
-    TxnOutcome::Executed {
-        status: ExecutionStatus::Success,
-        fee_statement: FeeStatement::zero(),
-        effects: interp.finish(),
+pub(super) fn system_txn_outcome(interp: InterpreterContext<'_>) -> TxnOutcome {
+    match interp.finish() {
+        Ok(effects) => TxnOutcome::Executed {
+            status: ExecutionStatus::Success,
+            fee_statement: FeeStatement::zero(),
+            effects,
+        },
+        Err(e) => TxnOutcome::Panic(e),
     }
 }
 
-/// BCS-encodes one system-call argument.
-pub(super) fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, MoveExecutionFailure> {
-    bcs::to_bytes(value)
-        .map_err(|e| invariant_violation(anyhow!("system call argument does not serialize: {e}")))
-        .map_err(MoveExecutionFailure::RuntimeError)
+/// Closes a system session whose effects are not published. The block either
+/// aborts or absorbs the failure, so the effects are dropped; finishing is what
+/// returns the worker's stack and heap.
+///
+/// Closing can still fail on its own — evacuation runs here — so the caller
+/// decides what a second failure means.
+pub(super) fn discard_system_session(
+    interp: InterpreterContext<'_>,
+) -> Result<(), VMInternalError> {
+    interp.finish().map(drop)
 }
 
-/// Calls `0x1::block::<function>` as the VM (`0x0`).
-pub(super) fn call_block_function(
-    interp: &mut InterpreterContext<'_>,
-    guard: &ExecutionGuard<'_>,
-    function: &IdentStr,
-    args: &[Vec<u8>],
+/// Calls `0x1::block::<function>` as the VM, with `place` filling the call
+/// args after the VM signer.
+pub(super) fn call_block_function<'a>(
+    interp: &mut InterpreterContext<'a>,
+    symbols: &FrameworkSymbols,
+    function: InternedIdentifier,
+    place: impl FnOnce(&mut CallBuilder<'_, '_>) -> Result<(), VMInternalError>,
 ) -> Result<(), MoveExecutionFailure> {
     let status = call_system_function_unmetered(
-        guard,
         interp,
-        &AccountAddress::ONE,
-        BLOCK,
+        symbols.block,
         function,
-        guard.type_list_of(&[]),
-        &[AccountAddress::ZERO.into_bytes()],
-        args,
+        EMPTY_TYPE_LIST,
+        &[VM_SIGNER],
+        place,
     )
     .map_err(MoveExecutionFailure::RuntimeError)?;
-    into_result(status)
+    call_result(status)
 }

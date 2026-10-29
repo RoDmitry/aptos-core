@@ -18,8 +18,7 @@ use crate::{
 use anyhow::{anyhow, ensure};
 use ark_ec::CurveGroup;
 use ark_ff::FftField;
-use rand::Rng;
-use rand_core::{CryptoRng, RngCore};
+use rand::{CryptoRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
@@ -280,7 +279,7 @@ impl<TC: ThresholdConfig> WeightedConfig<TC> {
             .map(|(i, w)| (self.get_player(i), *w))
             .collect::<Vec<(Player, usize)>>();
 
-        player_and_weights.sort_by(|a, b| a.1.cmp(&b.1));
+        player_and_weights.sort_by_key(|pw| pw.1);
         player_and_weights
     }
 

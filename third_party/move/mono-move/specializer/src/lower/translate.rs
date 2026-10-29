@@ -58,6 +58,8 @@ pub(super) struct LoweredFunction {
     /// Non-allocating PCs are not represented; the vector is sparse.
     /// Each entry's `code_offset` indexes directly into `code`.
     pub safe_points: Vec<SafePointEntry>,
+    /// Maximum scratch bytes required by any `Instr::Ret`, including padding.
+    pub scratch_size: u32,
 }
 
 /// TODO(cleanup): move this constant into a shared location and reuse elsewhere.
@@ -121,6 +123,7 @@ pub(super) fn lower_function(
         origins: state.origins_buf,
         entry_gas,
         safe_points: state.pending_safe_points,
+        scratch_size: state.scratch_size,
     })
 }
 
@@ -182,6 +185,8 @@ struct LoweringState<'a> {
     /// Origin of the IR instruction currently being lowered; every micro-op
     /// it expands to inherits this offset.
     current_origin: BytecodeOffset,
+    /// Maximum scratch bytes required by the `Instr::Ret`s lowered so far.
+    scratch_size: u32,
 }
 
 impl gas::CostResolver for LoweringState<'_> {
@@ -212,6 +217,7 @@ impl<'a> LoweringState<'a> {
             pending_safe_points: Vec::new(),
             origins_buf: Vec::new(),
             current_origin: 0,
+            scratch_size: 0,
         }
     }
 
@@ -588,7 +594,7 @@ impl<'a> LoweringState<'a> {
         op_name: &'static str,
         vec_ty: InternedType,
     ) -> VMResult<DescriptorId> {
-        self.ctx.descriptor_id(vec_ty).ok_or_else(|| {
+        self.ctx.vec_descriptor_id(vec_ty).ok_or_else(|| {
             VMInternalError::new(LoweringError::VectorTypeNoDescriptor { op: op_name })
         })
     }
@@ -889,7 +895,7 @@ impl<'a> LoweringState<'a> {
                         BinaryOp::Shl | BinaryOp::Shr => {
                             let ty = IntTy::from_type(lhs_ty)
                                 .filter(|t| !t.is_signed())
-                                .ok_or(LoweringError::ShiftRequiresUnsignedNonU64)?;
+                                .ok_or(LoweringError::ShiftRequiresUnsigned)?;
                             let shift_op = IntShiftOp {
                                 ty,
                                 dst,
@@ -980,6 +986,11 @@ impl<'a> LoweringState<'a> {
                             src: lhs,
                             imm: imm_to_u64(imm)?,
                         }),
+                        // Zero divisors and shifts >= 64 must produce VM errors only if executed.
+                        // Use checked integer operations, since the corresponding unchecked
+                        // u64 immediate operations require valid operands.
+                        BinaryOp::Div | BinaryOp::Mod if imm_to_u64(imm)? == 0 => None,
+                        BinaryOp::Shl | BinaryOp::Shr if shift_imm_u8(imm)? >= 64 => None,
                         BinaryOp::Div => Some(MicroOp::DivU64Imm {
                             dst,
                             src: lhs,
@@ -1055,7 +1066,7 @@ impl<'a> LoweringState<'a> {
                         BinaryOp::Shl | BinaryOp::Shr => {
                             let ty = IntTy::from_type(lhs_ty)
                                 .filter(|t| !t.is_signed())
-                                .ok_or(LoweringError::ShiftRequiresUnsignedNonU64)?;
+                                .ok_or(LoweringError::ShiftRequiresUnsigned)?;
                             let shift_op = IntShiftOp {
                                 ty,
                                 dst,
@@ -1366,11 +1377,9 @@ impl<'a> LoweringState<'a> {
 
             // --- Return ---
             Instr::Ret { srcs } => {
-                // `return_slots` overlap the home region (calling
-                // convention reuses that space), so a function like
-                // `swap(a, b) -> (b, a)` produces a swap-cycle in the
-                // copy graph. `emit_parallel_copy` handles arbitrary
-                // cycles via the function's reserved scratch slot.
+                // Return destinations overlap home slots, so returning `(b, a)`
+                // from parameters `(a, b)` can require a swap. Parallel copies
+                // preserve unread sources, using scratch to break cycles.
                 let mut copies = Vec::with_capacity(srcs.len());
                 for (ret_idx, slot) in srcs.iter().enumerate() {
                     let src = self.slot(*slot)?;
@@ -1382,7 +1391,14 @@ impl<'a> LoweringState<'a> {
                     });
                 }
                 let mut copy_ops = Vec::new();
-                parallel_copy::emit_parallel_copy(&mut copy_ops, &copies, self.ctx.scratch)?;
+                let scratch_used =
+                    parallel_copy::emit_parallel_copy(&mut copy_ops, &copies, self.ctx.scratch)?;
+                self.scratch_size = self.scratch_size.max(scratch_used);
+                // Scratch is not GC-tracked, so no GC may run while it holds values.
+                debug_assert!(
+                    !copy_ops.iter().any(MicroOp::is_allocating),
+                    "Ret copies must not allocate while scratch is live"
+                );
                 for copy_op in copy_ops {
                     self.emit(copy_op)?;
                 }
@@ -1896,7 +1912,7 @@ impl<'a> LoweringState<'a> {
                 let concrete_ty = self.concrete_ty(*resource_ty)?;
                 let descriptor_id = self
                     .ctx
-                    .descriptor_id(concrete_ty)
+                    .struct_descriptor_id(concrete_ty)
                     .ok_or(LoweringError::ResourceTypeNoDescriptor { op: "MoveTo" })?;
                 let box_ptr = self
                     .ctx
@@ -2199,7 +2215,7 @@ impl<'a> LoweringState<'a> {
 
     /// Advance the Transfer state machine after `instr` has been lowered.
     fn commit_transfer_bindings_after(&mut self, instr: &Instr<NamedSlot>) {
-        // Calls manage their own Transfer state in `lower_call`.
+        // Calls manage their own Transfer state in `bind_call_returns`.
         if !clobbers_transfer(instr) {
             // Release Transfer bindings consumed by this instr's value uses.
             // Place uses leave the slot live, so their binding
@@ -2262,6 +2278,7 @@ impl<'a> LoweringState<'a> {
             returns,
             heap_ptr_offsets,
             cs.required_descriptors.clone(),
+            cs.ret_slots.iter().map(|s| s.ty).collect(),
         )
         .map_err(|e| VMInternalError::new(LoweringError::NativeAbi(e)))
     }

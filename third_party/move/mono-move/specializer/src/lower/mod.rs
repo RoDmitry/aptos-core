@@ -30,8 +30,11 @@ enum LoweringError {
     #[error("Transfer({transfer}) read without a prior def in this block")]
     TransferReadWithoutDef { transfer: u16 },
 
-    #[error("scratch slot required when emitting 2+ parallel copies")]
-    ScratchSlotRequiredForParallelCopy,
+    #[error("parallel copy stuck: found no copy cycle to break")]
+    ParallelCopyNoProgress,
+
+    #[error("parallel copy scratch offset overflows u32")]
+    ParallelCopyScratchOverflow,
 
     // ---- GC layout derivation ----
     #[error("nominal type has no layout populated")]
@@ -42,6 +45,9 @@ enum LoweringError {
 
     #[error("layout id does not resolve to a layout")]
     LayoutIdUnresolved,
+
+    #[error("a layout published by type carries no type")]
+    LayoutWithoutType,
 
     #[error("gc_layout: field offset {field_offset} + inner offset {inner_offset} overflows u32")]
     GcFieldOffsetOverflow {
@@ -108,8 +114,8 @@ enum LoweringError {
     #[error("bitwise op on a signed value is invalid")]
     BitwiseOnSignedValue,
 
-    #[error("shift op requires an unsigned non-u64 integer type")]
-    ShiftRequiresUnsignedNonU64,
+    #[error("shift op requires an unsigned integer type")]
+    ShiftRequiresUnsigned,
 
     #[error("unexpected op in arith/bitwise lowering arm")]
     UnexpectedOpInArithArm,
@@ -189,10 +195,12 @@ impl IntoExecutionError for LoweringError {
             ExpectedReferenceType
             | ClosureSignatureNotFunction
             | TransferReadWithoutDef { .. }
-            | ScratchSlotRequiredForParallelCopy
+            | ParallelCopyNoProgress
+            | ParallelCopyScratchOverflow
             | LayoutNotPopulated
             | TypeParamReachedGcLayout
             | LayoutIdUnresolved
+            | LayoutWithoutType
             | GcFieldOffsetOverflow { .. }
             | NoConcreteSize { .. }
             | StructLayoutNotPopulated { .. }
@@ -210,7 +218,7 @@ impl IntoExecutionError for LoweringError {
             | UnresolvedLabel { .. }
             | CastSourceNotInteger
             | BitwiseOnSignedValue
-            | ShiftRequiresUnsignedNonU64
+            | ShiftRequiresUnsigned
             | UnexpectedOpInArithArm
             | UnexpectedOpInShiftArm
             | ImmMustBeBool

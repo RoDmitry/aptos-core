@@ -31,6 +31,7 @@ use aptos_crypto::{
     CryptoMaterialError, HashValue,
 };
 use aptos_crypto_derive::{BCSCryptoHash, CryptoHasher};
+use move_value_view_derive::MoveValueView;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use rand::Rng;
@@ -112,7 +113,9 @@ pub enum Auth<'a> {
     },
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Serialize, Deserialize, MoveValueView,
+)]
 pub enum ReplayProtector {
     Nonce(u64),
     SequenceNumber(u64),
@@ -891,7 +894,7 @@ impl TransactionExecutableRef<'_> {
 /// limit (100 = 1x, 200 = 2x, 250 = 2.5x).
 ///
 /// INVARIANT: must match Move representation for BCS serialization.
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize, MoveValueView)]
 pub enum RequestedMultipliers {
     V1 {
         /// Execution-gas multiplier as percent of the base limit where 100 is 1x.
@@ -929,7 +932,7 @@ impl RequestedMultipliers {
 /// prologue.
 ///
 /// INVARIANT: must match Move representation for BCS serialization.
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize, MoveValueView)]
 pub enum UserTxnLimitsRequest {
     /// Fee payer owns a stake pool.
     StakePoolOwner { multipliers: RequestedMultipliers },
@@ -1587,6 +1590,30 @@ impl SignedTransaction {
         Ok(())
     }
 
+    /// Check the encrypted payload representation allowed at mempool admission
+    /// and batch creation. Internal Decrypted and FailedDecryption states are
+    /// never valid submissions, even when their signatures verify.
+    pub fn verify_encrypted_payload_for_submission(&self) -> Result<()> {
+        let Some(payload) = self.payload().as_encrypted_payload() else {
+            return Ok(());
+        };
+        ensure!(
+            payload.is_encrypted(),
+            "Encrypted transaction not in Encrypted state"
+        );
+        ensure!(
+            !payload.extra_config().is_multisig(),
+            "Encrypted transactions do not support multisig"
+        );
+        let signer_auth_keys = self
+            .authenticator_ref()
+            .all_signer_auth_keys(self.sender())
+            .context("Encrypted transactions are not supported with this authenticator type")?;
+        payload
+            .verify(self.sender(), signer_auth_keys)
+            .context("Encrypted transaction ciphertext verification failed")
+    }
+
     pub fn contains_duplicate_signers(&self) -> bool {
         let mut all_signer_addresses = self.authenticator.secondary_signer_addresses();
         all_signer_addresses.push(self.sender());
@@ -2212,12 +2239,10 @@ impl TransactionOutput {
             expected_events,
         );
 
-        // TODO(trading-native): this comparator ignores the checkpoint hashes
-        // (state/hot-state and `position_state_checkpoint_hash`), so replay-verify
-        // tooling (e.g. db-tool's `replay_on_archive`) can report a successful
-        // replay even when the authenticated position state root diverges from
-        // local execution. Validate the checkpoint hashes here before enabling
-        // COMPUTE_TRADING_NATIVE_STATE_ROOTS.
+        // Checkpoint hashes (state, hot state, position) are derived from many
+        // outputs and checked at ledger update, not here. The position ops
+        // themselves are covered above: `state_change_hash` hashes the V1 write
+        // set, extensions included.
         Ok(())
     }
 
@@ -2237,10 +2262,6 @@ impl TransactionOutput {
 
     pub fn state_update_refs(&self) -> impl Iterator<Item = (&StateKey, Option<&StateValue>)> + '_ {
         self.write_set.state_update_refs()
-    }
-
-    pub fn add_hotness(&mut self, hotness: BTreeSet<StateKey>) {
-        self.write_set.add_hotness(hotness);
     }
 }
 

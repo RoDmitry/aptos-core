@@ -6,13 +6,9 @@
 //! (`StaleNodeIndex`) is shared by every implementor; only the column
 //! family, progress keys, and name differ.
 
-use crate::{
-    position_merkle_db::PositionMerkleDb,
-    pruner::state_merkle_pruner::state_merkle_pruner_manager::StateMerklePrunerManager,
-    schema::{
-        db_metadata::DbMetadataKey, stale_node_index::StaleNodeIndexSchema,
-        stale_node_index_cross_epoch::StaleNodeIndexCrossEpochSchema,
-    },
+use crate::schema::{
+    db_metadata::DbMetadataKey, stale_node_index::StaleNodeIndexSchema,
+    stale_node_index_cross_epoch::StaleNodeIndexCrossEpochSchema,
 };
 use aptos_jellyfish_merkle::StaleNodeIndex;
 use aptos_schemadb::schema::Schema;
@@ -116,7 +112,50 @@ impl MerklePrunerSchema for PositionEpochSnapshot {
     }
 }
 
-pub(crate) type PositionStateMerklePrunerManager =
-    StateMerklePrunerManager<PositionStateMerkle, PositionMerkleDb>;
-pub(crate) type PositionEpochSnapshotPrunerManager =
-    StateMerklePrunerManager<PositionEpochSnapshot, PositionMerkleDb>;
+/// Native-order regular merkle pruner.
+// Used once the order store is opened by the write path (PR 6).
+#[allow(dead_code)]
+pub(crate) enum OrderStateMerkle {}
+impl MerklePrunerSchema for OrderStateMerkle {
+    type StaleIndexSchema = StaleNodeIndexSchema;
+
+    fn name() -> &'static str {
+        "order_state_merkle_pruner"
+    }
+
+    fn worker_name() -> &'static str {
+        "order_state_merkle"
+    }
+
+    fn shard_progress_key(shard_id: usize) -> DbMetadataKey {
+        DbMetadataKey::OrderStateMerkleShardPrunerProgress(shard_id)
+    }
+
+    fn pruner_progress_key() -> DbMetadataKey {
+        DbMetadataKey::OrderStateMerklePrunerProgress
+    }
+}
+
+/// Native-order epoch-snapshot merkle pruner.
+// Used once the order store is opened by the write path (PR 6).
+#[allow(dead_code)]
+pub(crate) enum OrderEpochSnapshot {}
+impl MerklePrunerSchema for OrderEpochSnapshot {
+    type StaleIndexSchema = StaleNodeIndexCrossEpochSchema;
+
+    fn name() -> &'static str {
+        "order_epoch_snapshot_pruner"
+    }
+
+    fn worker_name() -> &'static str {
+        "order_epoch_snapshot"
+    }
+
+    fn shard_progress_key(shard_id: usize) -> DbMetadataKey {
+        DbMetadataKey::OrderEpochSnapshotShardPrunerProgress(shard_id)
+    }
+
+    fn pruner_progress_key() -> DbMetadataKey {
+        DbMetadataKey::OrderEpochSnapshotPrunerProgress
+    }
+}

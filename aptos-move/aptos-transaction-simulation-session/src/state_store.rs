@@ -5,7 +5,10 @@ use anyhow::{bail, Result};
 use aptos_types::{
     access_path::Path,
     state_store::{
-        state_key::{inner::StateKeyInner, StateKey},
+        state_key::{
+            inner::{StateKeyInner, TradingNativeKey},
+            StateKey,
+        },
         table::TableHandle,
     },
 };
@@ -84,14 +87,30 @@ impl std::fmt::Display for HumanReadable<&StateKey> {
                 write!(f, "table_item::{}::{}", handle.0, hex::encode(key))
             },
             StateKeyInner::Raw(bytes) => write!(f, "raw::{}", hex::encode(bytes)),
-            StateKeyInner::TradingNative(key) => write!(f, "trading_native::{:?}", key),
+            StateKeyInner::TradingNative(key) => match key {
+                TradingNativeKey::Position {
+                    exchange,
+                    account,
+                    market,
+                } => write!(f, "position::{}::{}::{}", exchange, account, market),
+                TradingNativeKey::Order {
+                    exchange,
+                    market,
+                    order_id,
+                } => write!(f, "order::{}::{}::{}", exchange, market, order_id),
+                TradingNativeKey::BulkOrder {
+                    exchange,
+                    market,
+                    account,
+                } => write!(f, "bulk_order::{}::{}::{}", exchange, market, account),
+            },
         }
     }
 }
 
 impl std::fmt::Display for HumanReadable<StateKey> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &HumanReadable(&self.0))
+        write!(f, "{}", HumanReadable(&self.0))
     }
 }
 
@@ -147,6 +166,26 @@ impl FromStr for HumanReadable<StateKey> {
                 let bytes = hex::decode(bytes)?;
                 Ok(HumanReadable(StateKey::raw(&bytes)))
             },
+            ["position", exchange, account, market] => {
+                let exchange = AccountAddress::from_str(exchange)?;
+                let account = AccountAddress::from_str(account)?;
+                let market = AccountAddress::from_str(market)?;
+                Ok(HumanReadable(StateKey::position(exchange, account, market)))
+            },
+            ["order", exchange, market, order_id] => {
+                let exchange = AccountAddress::from_str(exchange)?;
+                let market = AccountAddress::from_str(market)?;
+                let order_id = order_id.parse::<u128>()?;
+                Ok(HumanReadable(StateKey::order(exchange, market, order_id)))
+            },
+            ["bulk_order", exchange, market, account] => {
+                let exchange = AccountAddress::from_str(exchange)?;
+                let market = AccountAddress::from_str(market)?;
+                let account = AccountAddress::from_str(account)?;
+                Ok(HumanReadable(StateKey::bulk_order(
+                    exchange, market, account,
+                )))
+            },
             _ => bail!("Unknown StateKey format: {}", s),
         }
     }
@@ -168,6 +207,9 @@ fn test_state_key_roundtrip() -> Result<()> {
         "table_item::0x1::",
         "raw::aabbccdd",
         "raw::",
+        "position::0x5::0x1234::0x2",
+        "order::0x5::0x2::340282366920938463463374607431768211455",
+        "bulk_order::0x5::0x2::0x1234",
     ];
 
     for key in keys {

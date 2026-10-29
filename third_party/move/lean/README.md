@@ -1,105 +1,145 @@
-# *WIP* Leaner Move
+# *WIP* Verex
 
-This experimental project is a source language for writing Move contracts in
-Lean 4, together with a verifier that proves contracts directly against the
-authored source and a compiler that lowers the same source to production Move
-bytecode.
+This experimental project is a language-neutral intermediate representation
+(VIR) in Lean 4 with semantic profiles for Move and Rust, a Lean-authored
+source language over it (VerexSL), a verifier that proves contracts
+against the source semantics, and frontends from Move and Rust.
 
-A module is ordinary Lean syntax.  `spec` attaches a contract declaratively and
-`verify` turns it into a theorem checked by the Lean kernel:
+A module is ordinary Lean syntax. `spec` attaches a contract and `verify`
+turns it into a theorem checked by the Lean kernel:
 
 ```lean
-import Move
-
-open scoped Move Move.Spec
-
-module Account where
-
+verex module 0x42::account where
   struct Balance has Key where
-    value : U64
+    value : u64
 
-  entry fun deposit (addr : Address) (amount : U64) : Action Unit := do
-    let value ← &mut Balance[addr].value
-    value := *value + amount
+  public entry fun deposit(addr : Address, amount : u64) -> Unit := do
+    let balance := &mut Balance[addr]
+    *balance := new Balance { value := (*balance).value + amount }
 
-  spec deposit (addr : Address) (amount : U64) where
-    requires existsAt<Balance>(addr);
-    modifies Balance[addr];
-    ensures Balance[addr].value = old(Balance[addr].value) + amount;
-    aborts_if ¬old(Balance[addr].value).toNat + amount.toNat < U64.size
-      with Semantics.Checked.arithmeticAbortCode
+  spec deposit where
+    requires exists<Balance>(addr)
+    ensures global<Balance>(addr).value == old(global<Balance>(addr).value) + amount
+    aborts_if global<Balance>(addr).value + amount > 18446744073709551615
+    modifies global<Balance>(addr)
 
   verify deposit
 ```
 
-The same source has two distinct uses:
+Three claims stay separate:
 
-1. **Source verification.**  `verify f` produces `f.verified : f.contract`,
-   proved over the generated relational semantics of the authored function.
-2. **Executable compilation.**  Selected declarations are lowered through typed
-   base LCNF, `Move.Compiler.LIR`, and `MoveModel.IR` into versioned XIR, then
-   compiled by the complete compiler-v2 pipeline and checked by the production
-   Move bytecode verifier.
+1. **Source verification.** `verify f` proves a theorem about the big-step
+   semantics of the validated VIR of `f`
+   ([`designs/denotation.md`](designs/denotation.md)).
+2. **Compilation.** Supported declarations lower to XIR and production Move
+   bytecode.
+3. A compiler-correctness theorem connecting the two is future work.
 
-A compiler-correctness theorem connecting `f.verified` to the emitted bytecode
-remains future work; the prototype does not conflate those claims.  XIR is a
-compiler exchange format, not a proof artifact.
+A Move file, or a Rust file with its specifications in a VerexSL file
+beside it, is verified by rendering it as VerexSL, with every message
+reported at its position in the original files
+([`designs/source-verification.md`](designs/source-verification.md)):
 
-## Components
-
-| Package | Library | Purpose |
-|---|---|---|
-| `move` | [`Move`](move/Move/README.md) | The Leaner Move source language: surface, source contracts, the `verify` proof engine, and lowering to XIR, with its regressions under `Move/Tests`.  **Start here.** |
-| `move-model` | [`MoveModel`](move-model/MoveModel/README.md) | A logical model of Move bytecode: stackless IR, execution semantics, prover stages, and masm/Move source embedding, with its regressions under `MoveModel/Tests`.  What `Move` compiles into, and usable on its own. |
-
-Two Lake packages, each holding the library of the same name; `move` depends on
-`move-model`.  A downstream project requires whichever it needs:
-
-```toml
-[[require]]
-name = "move"
-path = "<checkout>/third_party/move/lean/move"
+```bash
+verex-move verify vault.move
+verex-rust verify bounds.rs      # specifications in bounds.spec.lean
 ```
 
-The language is defined in [`leaner-move.md`](move/Move/leaner-move.md), the
-verification design in
-[`verification-design.md`](move/Move/verification-design.md), and what the
-surface does *not* yet handle in
-[`project-plan.md`](move/Move/project-plan.md).  Each library README owns its
-architecture, module index, and roadmap.
+## Packages
+
+| Package | Purpose |
+|---|---|
+| [`verex-ir`](verex-ir/) | The shared typed VIR: RawUnit JSON import, validation, semantics, interpreter, proofs, the denotation-based verifier, and VerexSL. |
+| [`verex-move`](verex-move/) | The Move semantic profile and intrinsic registry, the Move exchange frontend (`VerexMove/Frontend`), and the XIR backend (`VerexMove/Xir`) through which compiler-v2 compiles `.lean` sources to Move bytecode. |
+| [`verex-rust`](verex-rust/) | The Rust semantic profile, source backend, and the Lean-owned import CLI over [`rust-exporter`](verex-rust/rust-exporter/), a standalone Rustc Public exporter of borrow-checked MIR. |
+| [`verex-e2e-tests`](verex-e2e-tests/) | Move-to-VerexSL and Rust-to-VerexSL baselines, verification of Move and Rust sources, and the verification check fixtures (ledger in [`designs/roadmap.md`](designs/roadmap.md#tests)). |
+
+[`v0/`](v0/) holds the deprecated reference packages `move`, `move-model`,
+and `transpiler`; nothing links them. Designs live in [`designs/`](designs/), with
+executed or superseded ones under [`designs/historical/`](designs/historical/);
+[`designs/roadmap.md`](designs/roadmap.md) holds the status: what is open and the test ledger.
 
 ## Build and test
 
-Install the repository-pinned Lean toolchain with the standard development
-setup script. The script verifies the downloaded release archive and adds its
-tools to the shell profile.
+Install the pinned Lean toolchain from the repository root:
 
 ```bash
-scripts/dev_setup.sh -p -l
+./scripts/dev_setup.sh -p -l
 source "$HOME/.profile"
 ```
 
-```bash
-cd move-model && lake build     # the logical model
-cd move       && lake build     # Leaner Move (builds move-model first)
-```
-
-The core libraries do not require the Aptos CLI. The regression suites do
-require the exchange frontend. Build its lightweight single-file entrypoint and
-set `APTOS_MOVE_EXCHANGE` in your shell profile; this is **highly recommended**
-for normal Leaner development because it avoids rebuilding the full Aptos CLI
-and greatly improves edit/test turnaround. Then run each package's suite:
+Every package is an independent Lake package; build and test it from its
+own directory:
 
 ```bash
-cargo build -p aptos-move-cli --bin aptos-move-exchange
-export APTOS_MOVE_EXCHANGE="$PWD/../../../target/debug/aptos-move-exchange"
-cd move-model && lake test
-cd move       && lake test
+(cd verex-ir         && lake build && lake test)
+(cd verex-move       && lake build && lake test)
+(cd verex-rust       && lake build && lake test)
+(cd verex-e2e-tests && lake build && lake test)
 ```
 
-`APTOS_CLI=<path-to-aptos>` remains supported for the full `aptos move
-exchange` command.
+The core libraries need no Aptos CLI. The end-to-end driver builds the
+standalone Move exchange CLI itself (`cargo build --locked --profile ci -p
+aptos-move-cli --features binary --bin move`); see [`CLAUDE.md`](CLAUDE.md)
+for the `APTOS_MOVE_CLI` and `APTOS_CLI` contracts and the rest of the
+working rules.
 
-Proof cost is tracked with `scripts/bench-proofs.sh`; the encoding's cost
-analysis is in
-[`performance-analysis.md`](move/Move/performance-analysis.md).
+## Verifying sources
+
+The verifiers read Move through the standalone Move CLI, which
+`APTOS_MOVE_CLI` names (see [Build and test](#build-and-test)). Each run
+reports messages at their positions in the source files and ends with the
+wall time per phase:
+
+```bash
+cd verex-move
+lake exe verex-move verify <file.move | package>         # every specified function
+lake exe verex-move verify <package> --filter vector     # modules whose file names contain it
+lake exe verex-move verify <file.move> --heartbeats 400 # default budget, thousands
+cd ../verex-rust
+lake exe verex-rust verify <file.rs>                    # specifications in <file>.spec.lean
+```
+
+From the Move CLI, a package is verified in place; the Move Prover's unit
+tests run with it on request:
+
+```bash
+move prove --lean --package-dir <package>                # or: aptos move prove --lean
+MVP_TEST_FEATURE=lean cargo test -p move-prover --test testsuite
+```
+
+A function the automatic verification leaves open is proved in a proof
+file beside its Move file; the failure message names the file. The file's
+header establishes the context of its module, and `verex_obligations`
+splits the function's goal into its obligations, each named by the clause it
+owes, which `verex_decide` and `verex_prepare`, or any Lean tactics, then
+prove:
+
+```move
+spec square_of_sum {
+    pragma verify = manual;     // proved in proofs.proof.lean
+    pragma heartbeats = 400;    // this function's budget, thousands
+    ensures result == a * a + 2 * a * b + b * b;
+}
+```
+
+```lean
+-- proofs.proof.lean, beside proofs.move
+import VerexMove.Proofs
+
+verex proofs for "proofs.move"
+verex proofs where
+
+verify square_of_sum by
+  verex_obligations
+  all_goals (first | verex_decide | (verex_prepare; all_goals try verex_decide))
+  case ensures_1 => …
+```
+
+The Move Prover reads `verify = manual` as true and ignores `heartbeats`.
+In the editor, `verify` items and automatic targets are skipped (`verex.skip_verify`, on by
+default in the language server only); `verify! f`, marked by the code action "Verify `f` here",
+runs. A proof file opens with its goals in the InfoView once its Move file
+has been verified: the header loads the rendering that verification wrote
+(`.verex/` beside the file, `build/` of a package).
+Details: [`designs/source-verification.md`](designs/source-verification.md).

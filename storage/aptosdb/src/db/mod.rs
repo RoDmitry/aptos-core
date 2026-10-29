@@ -2,17 +2,22 @@
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
 use crate::{
-    backup::backup_handler::BackupHandler, db::aptosdb_native_position::PositionBundle,
-    event_store::EventStore, ledger_db::LedgerDb, position_db::PositionDb,
-    position_merkle_db::PositionMerkleDb, pruner::LedgerPrunerManager,
-    rocksdb_property_reporter::RocksdbPropertyReporter, state_kv_db::StateKvDb,
-    state_merkle_db::StateMerkleDb, state_store::StateStore, transaction_store::TransactionStore,
+    backup::backup_handler::BackupHandler,
+    event_store::EventStore,
+    ledger_db::LedgerDb,
+    native_store::{kv_db::PositionDb, merkle_db::PositionMerkleDb},
+    pruner::LedgerPrunerManager,
+    rocksdb_property_reporter::RocksdbPropertyReporter,
+    state_kv_db::StateKvDb,
+    state_merkle_db::StateMerkleDb,
+    state_store::StateStore,
+    transaction_store::TransactionStore,
 };
 use aptos_config::config::{HotStateConfig, PrunerConfig, RocksdbConfigs, StorageDirPaths};
 use aptos_db_indexer::db_indexer::InternalIndexerDB;
 use aptos_logger::prelude::*;
 use aptos_schemadb::{batch::SchemaBatch, Cache, Env};
-use aptos_storage_interface::{db_ensure as ensure, AptosDbError, Result};
+use aptos_storage_interface::{db_ensure as ensure, Result};
 use aptos_types::{ledger_info::LedgerInfoWithSignatures, transaction::Version};
 use std::{path::Path, sync::Arc, time::Instant};
 use tokio::sync::watch::Sender;
@@ -50,6 +55,7 @@ mod aptosdb_internal;
 // Native-position subsystem: `PositionBundle` + `impl AptosDB` for
 // `position()` / `native_state_committer()` / `init_native_position()`.
 mod aptosdb_native_position;
+pub(crate) use aptosdb_native_position::PositionBundle;
 // Testonly methods.
 #[cfg(any(test, feature = "fuzzing", feature = "consensus-only-perf-test"))]
 mod aptosdb_testonly;
@@ -202,7 +208,11 @@ impl AptosDB {
 
     /// Gets an instance of `BackupHandler` for data backup purpose.
     pub fn get_backup_handler(&self) -> BackupHandler {
-        BackupHandler::new(Arc::clone(&self.state_store), Arc::clone(&self.ledger_db))
+        BackupHandler::new(
+            Arc::clone(&self.state_store),
+            Arc::clone(&self.ledger_db),
+            self.position.clone(),
+        )
     }
 
     /// Creates new physical DB checkpoint in directory specified by `path`.
@@ -256,6 +266,13 @@ impl AptosDB {
         );
         let mut ledger_batch = SchemaBatch::new();
         ledger_metadata_db.put_ledger_info(genesis_li, &mut ledger_batch)?;
-        ledger_metadata_db.write_schemas(ledger_batch)
+        ledger_metadata_db.write_schemas(ledger_batch)?;
+
+        // The cached latest ledger info is otherwise only populated when the DB
+        // is opened, so without this the DB reports no ledger info at all until
+        // the next restart.
+        ledger_metadata_db.set_latest_ledger_info(genesis_li.clone());
+
+        Ok(())
     }
 }

@@ -97,20 +97,17 @@ impl BufferedStateExtras<SnapshotToCommit, StateWithSummary> for HotStateAccumul
 }
 
 impl BufferedState {
+    /// Starts the snapshot pipeline on top of `last_snapshot`, which `current_state` and
+    /// `persisted_state` must already be at.
     pub(crate) fn new_at_snapshot(
         state_db: &Arc<StateDb>,
         last_snapshot: StateWithSummary,
         target_items: usize,
-        out_current_state: Arc<Mutex<LedgerStateWithSummary>>,
-        out_persisted_state: PersistedState,
+        current_state: Arc<Mutex<LedgerStateWithSummary>>,
+        persisted_state: PersistedState,
     ) -> Self {
         let arc_state_db = Arc::clone(state_db);
-        *out_current_state.lock() =
-            LedgerStateWithSummary::new_at_checkpoint(last_snapshot.clone());
-        out_persisted_state.hack_reset(last_snapshot.clone());
-
         let merklize_state_db = Arc::clone(&arc_state_db);
-        let persisted_state_clone = out_persisted_state.clone();
         let commit_thread = spawn_commit_pipeline(
             "state-committer",
             ASYNC_COMMIT_CHANNEL_BUFFER_SIZE as usize,
@@ -118,8 +115,7 @@ impl BufferedState {
             STATE_BATCH_CHANNEL_SIZE,
             last_snapshot.clone(),
             move |batch_receiver| {
-                StateMerkleBatchCommitter::new(arc_state_db, batch_receiver, persisted_state_clone)
-                    .run();
+                StateMerkleBatchCommitter::new(arc_state_db, batch_receiver, persisted_state).run();
             },
             move |last_snapshot, input| {
                 merklize_main_state(&merklize_state_db, last_snapshot, input)
@@ -127,7 +123,7 @@ impl BufferedState {
         );
         BufferedState::new(
             BufferedStateCore::new(
-                out_current_state,
+                current_state,
                 last_snapshot,
                 commit_thread,
                 target_items,

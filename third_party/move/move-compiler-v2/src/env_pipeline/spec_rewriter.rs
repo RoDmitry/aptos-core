@@ -28,7 +28,7 @@ use log::debug;
 use move_model::{
     ast::{
         ConditionKind, Exp, ExpData, FrameSpec, FunParamAccessOf, GlobalInvariant, MemoryRange,
-        Operation, SpecBlockTarget, SpecFunDecl, VisitorPosition,
+        Operation, SpecBlockTarget, SpecFunDecl,
     },
     exp_rewriter::ExpRewriterFunctions,
     model::{
@@ -218,6 +218,54 @@ pub fn run_spec_rewriter(env: &mut GlobalEnv) {
     }
     targets.write_to_env(env);
 
+    compute_spec_fun_memory_summaries(env);
+
+    // Compute spec memory for behavioral predicates.
+    // For each function, derive (used_memory, old_memory) from its spec conditions.
+    // Also populate access_of entries with derived memory.
+    compute_behavioral_predicate_memory(env);
+
+    // Validate that closures passed to functions with access_of respect the limits.
+    validate_closure_access_of_compliance(env);
+
+    // Last, process invariants
+    for module in env.get_modules() {
+        if module.is_target() {
+            for str in module.get_structs() {
+                check_data_invariants(&str)
+            }
+        }
+    }
+    collect_global_invariants_to_env(env)
+}
+
+/// Computes each spec function's transitive callees, used memory, and
+/// old-state memory from its body, and returns whether any summary changed.
+///
+/// Spec functions can carry behavioral predicates, whose memory is the target
+/// function's specification memory. That memory is only known once function
+/// summaries exist, and those in turn consume spec function memory, so
+/// `compute_behavioral_predicate_memory` calls this again inside its
+/// fixpoint rather than once up front.
+fn compute_spec_fun_memory_summaries(env: &mut GlobalEnv) -> bool {
+    let snapshot = |env: &GlobalEnv| -> Vec<_> {
+        env.get_modules()
+            .flat_map(|m| {
+                m.get_spec_funs()
+                    .map(|(_, decl)| {
+                        (
+                            decl.used_memory.clone(),
+                            decl.generic_used_memory.clone(),
+                            decl.old_memory.clone(),
+                            decl.generic_old_memory.clone(),
+                            decl.uses_old,
+                        )
+                    })
+                    .collect_vec()
+            })
+            .collect_vec()
+    };
+    let before = snapshot(env);
     // Now that all functions are defined, compute transitive callee and used memory,
     // as well as `uses_old` and `old_memory` for dual-state spec funs.
     // Since specification functions can be recursive we compute the strongly-connected
@@ -434,24 +482,7 @@ pub fn run_spec_rewriter(env: &mut GlobalEnv) {
                 .clone_from(&transitive_generic_old_memory);
         }
     }
-
-    // Compute spec memory for behavioral predicates.
-    // For each function, derive (used_memory, old_memory) from its spec conditions.
-    // Also populate access_of entries with derived memory.
-    compute_behavioral_predicate_memory(env);
-
-    // Validate that closures passed to functions with access_of respect the limits.
-    validate_closure_access_of_compliance(env);
-
-    // Last, process invariants
-    for module in env.get_modules() {
-        if module.is_target() {
-            for str in module.get_structs() {
-                check_data_invariants(&str)
-            }
-        }
-    }
-    collect_global_invariants_to_env(env)
+    snapshot(env) != before
 }
 
 /// Entry point to generate spec functions from lambda expressions to be expanded during inlining
@@ -741,7 +772,7 @@ fn companion_local_qualification(env: &GlobalEnv, fun: &FunctionEnv) -> Companio
 /// Whether the given native function may appear as a callee of a
 /// companion-derived pure function: its `$`-spec version is defined in the
 /// Boogie prelude (`native.bpl` for the `std::vector` bytecode-instruction
-/// natives, `prelude.bpl` for `$1_signer_$borrow_address`).
+/// natives, `prelude.bpl` for `$1.signer.$borrow_address`).
 fn is_companion_safe_native(fun: &FunctionEnv) -> bool {
     if !fun.is_native() {
         return false;
@@ -817,45 +848,31 @@ fn derive_spec_fun(
     env.add_spec_function_def(fun_id.module_id, decl)
 }
 
-/// Computes direct `old()` usage for a spec fun body. Returns (uses_old, old_memory)
-/// where `uses_old` is true if the body contains `Operation::Old`, and `old_memory`
-/// is the set of resources accessed inside `old()` contexts.
+/// Computes direct `old()` usage for a spec fun body. Returns `(uses_old,
+/// old_memory)`: the memory read in the pre-state, and whether the body is
+/// two-state at all.
+///
+/// The memory comes from [`ExpData::directly_old_memory`], so it includes what a
+/// behavioral predicate's target reads in its pre-state, not only what sits
+/// under a literal `old(..)`. Mutation builtins are inherently two-state and
+/// contribute the resource they update. Such a body has no `old(..)` of its own
+/// yet still needs both states.
 pub fn compute_direct_old_usage(
     body: &Exp,
     env: &GlobalEnv,
 ) -> (bool, BTreeSet<QualifiedInstId<StructId>>) {
-    let mut uses_old = false;
-    let mut old_memory = BTreeSet::new();
-    let mut in_old_depth: usize = 0;
-    body.visit_positions(&mut |pos, exp| {
+    let mut old_memory = body.directly_old_memory(env);
+    let mut uses_old = !old_memory.is_empty();
+    body.visit_post_order(&mut |exp| {
         match exp {
-            ExpData::Call(_, Operation::Old, _) => match pos {
-                VisitorPosition::Pre => {
-                    uses_old = true;
-                    in_old_depth += 1;
-                },
-                VisitorPosition::Post => {
-                    in_old_depth -= 1;
-                },
-                _ => {},
-            },
-            ExpData::Call(id, Operation::Global(_), _)
-            | ExpData::Call(id, Operation::Exists(_), _)
-                if in_old_depth > 0 && matches!(pos, VisitorPosition::Pre) =>
-            {
-                let inst = &env.get_node_instantiation(*id);
-                let (mid, sid, sinst) = inst[0].require_struct();
-                old_memory.insert(mid.qualified_inst(sid, sinst.to_owned()));
-            },
-            // Mutation builtins are inherently two-state: they transition from
-            // pre-state to post-state. Their resource type is in old_memory.
+            ExpData::Call(_, Operation::Old, _) => uses_old = true,
             ExpData::Call(
                 id,
                 Operation::SpecPublish(_) | Operation::SpecRemove(_) | Operation::SpecUpdate(_),
                 _,
-            ) if matches!(pos, VisitorPosition::Pre) => {
+            ) => {
                 uses_old = true;
-                let inst = &env.get_node_instantiation(*id);
+                let inst = env.get_node_instantiation(*id);
                 let (mid, sid, sinst) = inst[0].require_struct();
                 old_memory.insert(mid.qualified_inst(sid, sinst.to_owned()));
             },
@@ -863,10 +880,6 @@ pub fn compute_direct_old_usage(
         }
         true
     });
-    // `object::spec_exists_at<T>` is a direct translation of `exists<T>` in
-    // the prover.  It is represented as a spec-function call in the AST, so
-    // include its concrete resource memory when it occurs under `old(..)`.
-    old_memory.extend(body.directly_old_memory(env));
     (uses_old, old_memory)
 }
 
@@ -1072,11 +1085,17 @@ fn compute_behavioral_predicate_memory(env: &mut GlobalEnv) {
                 ));
             }
         }
-        if updates.is_empty() {
-            break;
-        }
+        let functions_changed = !updates.is_empty();
         for (fun_id, used, generic_used, old, generic_old, uses_old) in updates {
             env.set_function_spec_memory(fun_id, used, generic_used, old, generic_old, uses_old);
+        }
+        // Spec functions carry behavioral predicates too, and their summaries
+        // were closed before any function summary existed. Re-close them now
+        // that targets have memory; if that moved anything, function
+        // specifications consuming those spec functions must be revisited.
+        let spec_funs_changed = compute_spec_fun_memory_summaries(env);
+        if !functions_changed && !spec_funs_changed {
+            break;
         }
     }
 
@@ -1291,17 +1310,15 @@ fn validate_closure_access_of_compliance(env: &GlobalEnv) {
             }
             if let ExpData::Call(call_id, Operation::MoveFunction(mid, fid), args) = exp {
                 let callee_id = mid.qualified(*fid);
-                let (callee_param_access, callee_params) = {
-                    let callee_env = env.get_function(callee_id);
-                    let access = callee_env.get_fun_param_access_of().to_vec();
-                    // Skip validation only for transparent callees with no declarations.
-                    // For opaque callees, missing declarations means "pure" — validate
-                    // that closures don't access memory.
-                    if access.is_empty() && !callee_env.is_opaque() {
-                        return true;
-                    }
-                    (access, callee_env.get_parameters())
-                };
+                let callee_env = env.get_function(callee_id);
+                let callee_param_access = callee_env.get_fun_param_access_of().to_vec();
+                // Skip validation only for transparent callees with no declarations.
+                // For opaque callees, missing declarations means "pure" — validate
+                // that closures don't access memory.
+                if callee_param_access.is_empty() && !callee_env.is_opaque() {
+                    return true;
+                }
+                let callee_params = callee_env.get_parameters();
 
                 // For each argument, check if it maps to a parameter with access_of
                 for (arg_idx, arg) in args.iter().enumerate() {
@@ -1322,6 +1339,11 @@ fn validate_closure_access_of_compliance(env: &GlobalEnv) {
                         .find(|a| a.fun_param == *param_name)
                     {
                         Some(a) => a,
+                        None if callee_env.leaves_fun_param_frame_to_call_site(*param_name)
+                            && !is_forwarded_param(arg, &caller_params) =>
+                        {
+                            continue
+                        },
                         None => {
                             empty_access = FunParamAccessOf {
                                 loc: Loc::default(),
@@ -1402,6 +1424,17 @@ fn validate_closure_access_of_compliance(env: &GlobalEnv) {
             true
         });
     }
+}
+
+/// Whether the argument is a function-typed parameter of the enclosing function, passed
+/// straight through to the callee.
+///
+/// A callee that defers its frame cannot bound such an argument, and neither can this call
+/// site: the closure was built somewhere else. What does bound it is the enclosing
+/// function's own `modifies_of`/`reads_of` for the parameter, which `compute_arg_memory`
+/// resolves exactly, so forwarding is checked rather than deferred.
+fn is_forwarded_param(arg: &Exp, caller_params: &[Parameter]) -> bool {
+    matches!(arg.as_ref(), ExpData::Temporary(_, idx) if *idx < caller_params.len())
 }
 
 /// Computes the memory footprint of a function-typed argument expression.
@@ -1896,5 +1929,24 @@ mod tests {
         assert!(converter.rewrite_node_id(id).is_none());
 
         assert_eq!(env.get_quant_weight(id), Some(9));
+    }
+
+    #[test]
+    fn spec_update_is_inherently_two_state() {
+        let env = fresh_env();
+        let mid = ModuleId::new(0);
+        let sid = StructId::new(env.symbol_pool().make("Resource"));
+        let id = env.new_node(Loc::default(), BOOL_TYPE.clone());
+        env.set_node_instantiation(id, vec![Type::Struct(mid, sid, vec![])]);
+        let body =
+            ExpData::Call(id, Operation::SpecUpdate(MemoryRange::default()), vec![]).into_exp();
+
+        let (uses_old, old_memory) = compute_direct_old_usage(&body, &env);
+
+        assert!(uses_old);
+        assert_eq!(
+            old_memory,
+            BTreeSet::from([mid.qualified_inst(sid, vec![])])
+        );
     }
 }

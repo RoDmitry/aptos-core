@@ -11,6 +11,7 @@ pub mod block_metadata;
 pub mod block_metadata_ext;
 pub mod chain_id;
 pub mod contract_event;
+pub mod crypto;
 pub mod decryption;
 pub mod dkg;
 pub mod epoch_change;
@@ -68,6 +69,7 @@ pub mod bytes;
 pub mod delayed_fields;
 pub mod keyless;
 pub mod lazy_bls;
+pub mod lazy_crypto;
 pub mod state_store;
 #[cfg(test)]
 mod unit_tests;

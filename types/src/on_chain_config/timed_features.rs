@@ -67,6 +67,10 @@ pub enum TimedFeatureFlag {
     /// Charge execution gas for value deserialization proportional to the
     /// produced value size.
     MeterValueNodesOnDeserialize,
+
+    /// Include the cost of a closure's type arguments in its abstract value
+    /// size, instead of charging a flat amount for any closure.
+    MeterClosureTypeArguments,
 }
 
 /// Representation of features that are gated by the block timestamps.
@@ -84,6 +88,8 @@ enum TimedFeaturesImpl {
 pub enum TimedFeatureOverride {
     Replay,
     Testing,
+    /// Used for comparison testing of Move VM V1 and MonoMove.
+    VmComparison,
 }
 
 impl TimedFeatureOverride {
@@ -98,6 +104,14 @@ impl TimedFeatureOverride {
             (Replay, _ModuleComplexityCheck) => Some(true),
             // Add overrides for testing here.
             (Testing, EntryCompatibility) => Some(true),
+
+            // For both, disables gas metering that was enabled by timed feature
+            // flags. For comparison, those charges are enabled by the
+            // appropriate gas feature version and can be programmatically set
+            // to 0.
+            (VmComparison, MeterBcsByValueSize) => Some(false),
+            (VmComparison, MeterValueNodesOnDeserialize) => Some(false),
+
             // Exhaustive over flags so adding a new flag forces a decision.
             (
                 _,
@@ -117,7 +131,8 @@ impl TimedFeatureOverride {
                 | RejectV5ModulePublishing
                 | RevalidateResolvedClosures
                 | MeterBcsByValueSize
-                | MeterValueNodesOnDeserialize,
+                | MeterValueNodesOnDeserialize
+                | MeterClosureTypeArguments,
             ) => None,
         }
     }
@@ -301,6 +316,22 @@ impl TimedFeatureFlag {
                 .unwrap()
                 .with_timezone(&Utc),
 
+            // Note: Set to a future date so forge's framework-upgrade compat test runs
+            // with this feature off, matching the pre-feature old image and avoiding a
+            // fork (see UseFullTransactionSizeForGasCheck).
+            (MeterClosureTypeArguments, TESTING) => Los_Angeles
+                .with_ymd_and_hms(2026, 9, 21, 23, 0, 0)
+                .unwrap()
+                .with_timezone(&Utc),
+            (MeterClosureTypeArguments, TESTNET) => Los_Angeles
+                .with_ymd_and_hms(2026, 9, 16, 14, 0, 0)
+                .unwrap()
+                .with_timezone(&Utc),
+            (MeterClosureTypeArguments, MAINNET) => Los_Angeles
+                .with_ymd_and_hms(2026, 9, 18, 14, 0, 0)
+                .unwrap()
+                .with_timezone(&Utc),
+
             // For chains other than testnet and mainnet, a timed feature is considered enabled from
             // the very beginning, if left unspecified.
             (_, TESTING | DEVNET | PREMAINNET) => BEGINNING_OF_TIME,
@@ -391,9 +422,13 @@ mod test {
 
     #[test]
     fn timed_features_override_is_serializable() {
-        let replay = assert_ok!(bcs::to_bytes(&TimedFeatureOverride::Replay));
-        let testing = assert_ok!(bcs::to_bytes(&TimedFeatureOverride::Testing));
-        assert_ne!(replay, testing);
+        fn assert_index(value: TimedFeatureOverride, index: u8) {
+            assert_eq!(assert_ok!(bcs::to_bytes(&value)), [index]);
+        }
+
+        assert_index(TimedFeatureOverride::Replay, 0);
+        assert_index(TimedFeatureOverride::Testing, 1);
+        assert_index(TimedFeatureOverride::VmComparison, 2);
     }
 
     #[test]

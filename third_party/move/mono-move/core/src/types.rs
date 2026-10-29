@@ -43,11 +43,11 @@
 //! ## Generic structs
 
 use crate::{
-    interner::{InternedIdentifier, InternedModuleId},
+    interner::{view_module_id, InternedIdentifier, InternedModuleId},
     Interner,
 };
 use mono_move_alloc::GlobalArenaPtr;
-use move_core_types::ability::AbilitySet;
+use move_core_types::{ability::AbilitySet, account_address::AccountAddress};
 use std::{cmp::PartialEq, fmt};
 
 // ================================================================================================
@@ -135,6 +135,12 @@ pub fn view_type(ptr: InternedType) -> &'static Type {
     unsafe { ptr.as_ref_unchecked() }
 }
 
+/// Whether `ty` can name a resource in global storage, i.e. it is a struct or
+/// an enum type.
+pub fn is_resource_type(ty: InternedType) -> bool {
+    matches!(view_type(ty), Type::Nominal { .. })
+}
+
 /// Returns a reference to the arena-interned list of [`InternedType`]s
 /// behind `ptr`.
 pub fn view_type_list(ptr: InternedTypeList) -> &'static [InternedType] {
@@ -171,6 +177,25 @@ pub fn strip_ref(ref_ty: InternedType) -> Option<InternedType> {
         return None;
     };
     Some(*inner)
+}
+
+/// Whether `ty` is the struct or enum `address::module::name`, whatever its
+/// type arguments.
+///
+/// Inherits safety contract of [`view_type`].
+pub fn is_nominal(ty: InternedType, address: &AccountAddress, module: &str, name: &str) -> bool {
+    let Type::Nominal {
+        module_id,
+        name: ty_name,
+        ..
+    } = view_type(ty)
+    else {
+        return false;
+    };
+    let module_id = view_module_id(*module_id);
+    module_id.address() == address
+        && view_name(module_id.name()) == module
+        && view_name(*ty_name) == name
 }
 
 /// Whether a value of type `actual` may be used where `expected` is required.
@@ -375,34 +400,35 @@ pub fn intrinsic_slot_size_and_align(ty: &Type) -> Option<(Size, Alignment)> {
     })
 }
 
-impl Type {
-    /// The short kind word for this type (`"u64"`, `"vector"`, `"struct"`, ...).
-    /// Mirrors the legacy VM's `TypeTag::to_short_string`.
-    pub fn short_name(&self) -> &'static str {
-        match self {
-            Type::Bool => "bool",
-            Type::U8 => "u8",
-            Type::U16 => "u16",
-            Type::U32 => "u32",
-            Type::U64 => "u64",
-            Type::U128 => "u128",
-            Type::U256 => "u256",
-            Type::I8 => "i8",
-            Type::I16 => "i16",
-            Type::I32 => "i32",
-            Type::I64 => "i64",
-            Type::I128 => "i128",
-            Type::I256 => "i256",
-            Type::Address => "address",
-            Type::Signer => "signer",
-            Type::Vector { .. } => "vector",
-            Type::Nominal { .. } => "struct",
-            Type::Function { .. } => "function",
-            Type::ImmutRef { .. } | Type::MutRef { .. } => "reference",
-            Type::TypeParam { .. } => "type parameter",
-        }
+/// Whether `ty` is `signer` or `&signer`, the parameter shapes that fill from
+/// a transaction signer.
+pub fn is_signer_or_signer_immut_ref(ty: InternedType) -> bool {
+    match view_type(ty) {
+        Type::Signer => true,
+        Type::ImmutRef { inner } => matches!(view_type(*inner), Type::Signer),
+        Type::Bool
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::U128
+        | Type::U256
+        | Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::I64
+        | Type::I128
+        | Type::I256
+        | Type::Address
+        | Type::MutRef { .. }
+        | Type::Vector { .. }
+        | Type::Nominal { .. }
+        | Type::Function { .. }
+        | Type::TypeParam { .. } => false,
     }
+}
 
+impl Type {
     /// True iff this is `Type::U64`. Used by the specializer to gate the
     /// u64-specialized micro-op fast paths.
     #[inline(always)]
@@ -459,9 +485,8 @@ pub const SIGNER_TY: InternedType = GlobalArenaPtr::from_static(&SIGNER);
 pub const EMPTY_TYPE_LIST: InternedTypeList =
     InternedTypeList(GlobalArenaPtr::from_static(&EMPTY_LIST));
 
-/// Writes a textual representation of an interned type. Nominals print
-/// just their name — IR variants that carry `ty_args` show them
-/// separately. Inherits the arena safety contract on [`view_type`].
+/// Writes a textual representation of an interned type. Inherits the arena
+/// safety contract on [`view_type`].
 pub fn display_type(f: &mut fmt::Formatter<'_>, ty: InternedType) -> fmt::Result {
     match view_type(ty) {
         Type::Bool => write!(f, "bool"),
@@ -517,14 +542,14 @@ pub fn display_type(f: &mut fmt::Formatter<'_>, ty: InternedType) -> fmt::Result
         } => {
             write!(f, "|")?;
             display_type_list(f, *args)?;
-            write!(f, "|")?;
+            write!(f, "|(")?;
             display_type_list(f, *results)?;
-            write!(f, "{}", abilities.display_postfix())
+            write!(f, "){}", abilities.display_postfix())
         },
     }
 }
 
-/// Renders an interned type to its textual representation (see [`display_type`]).
+/// Renders an interned type to a string (see [`display_type`]).
 //
 // TODO(metering): this traversal is unbounded; replace with a metered, depth-bounded
 // version.

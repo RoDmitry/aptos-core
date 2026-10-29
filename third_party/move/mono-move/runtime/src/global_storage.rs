@@ -28,6 +28,9 @@
 //! `LocalHeap` write. Later mutable borrows in the same checkpoint reuse that
 //! copy.
 //!
+//! Once no rollback can follow, [`ResourceReadWriteSet::drop_unchanged_writes`]
+//! demotes every copy that still equals its read.
+//!
 //! # Checkpoints and the checkpoint counter
 //!
 //! Rather than snapshotting all state at each checkpoint, the set tags every
@@ -56,11 +59,12 @@ use crate::{
     error::{GlobalStorageOp, RuntimeError},
     heap::RootScanner,
     invariant_violation,
+    value_cmp::equals,
 };
 use hashbrown::{hash_map::EntryRef, HashMap};
 use mono_move_core::{
-    storage::resource_provider::InMemoryStorageKey, types::InternedType, ResourceProvider,
-    StorageRead, VMResult,
+    storage::resource_provider::InMemoryStorageKey, types::InternedType, LayoutProvider,
+    ResourceProvider, StorageRead, VMResult,
 };
 use std::ptr::NonNull;
 
@@ -114,8 +118,7 @@ pub struct Entry {
 pub enum WriteClass {
     /// Did not exist before, now does. Carries the value pointer to serialize.
     Creation(NonNull<u8>),
-    /// Existed before, now (possibly) modified — any mutable borrow counts,
-    /// even if the value is unchanged. Carries the value pointer to serialize.
+    /// Existed before, now modified. Carries the value pointer to serialize.
     Modification(NonNull<u8>),
     /// Existed before, now moved out.
     Deletion,
@@ -155,9 +158,6 @@ impl Entry {
             StorageWrite::NotModified => None,
             StorageWrite::LocalHeap { ptr, .. } => Some(match self.read {
                 StorageRead::DoesNotExist => WriteClass::Creation(ptr),
-                // TODO(correctness, perf): over-approximation — a `borrow_global_mut` copies to the
-                // local heap even if nothing changed. Compare against the read value to drop no-op
-                // modifications here rather than downstream.
                 StorageRead::ExternalHeap { .. } => WriteClass::Modification(ptr),
             }),
             StorageWrite::Deleted { .. } => match self.read {
@@ -261,6 +261,17 @@ impl ResourceReadWriteSet {
         group: Option<InternedType>,
     ) -> Result<bool, RuntimeError> {
         Ok(get_or_create_resource_entry(&mut self.entries, provider, key, group)?.exists())
+    }
+
+    /// Returns the pointer to the resource, or `None` if it does not exist or
+    /// was deleted.
+    pub(crate) fn read(
+        &mut self,
+        provider: &dyn ResourceProvider,
+        key: &InMemoryStorageKey,
+        group: Option<InternedType>,
+    ) -> Result<Option<NonNull<u8>>, RuntimeError> {
+        Ok(get_or_create_resource_entry(&mut self.entries, provider, key, group)?.as_ptr())
     }
 
     /// Returns the pointer to the resource. Returns an error if the resource
@@ -428,6 +439,40 @@ impl ResourceReadWriteSet {
             .filter_map(|(key, entry)| entry.write_class().map(|class| (key, class, entry.group)))
     }
 
+    /// Demotes to `NotModified` every local copy that still equals the value
+    /// it was copied from, so a mutable borrow that changed nothing is not a
+    /// write.
+    ///
+    /// Terminal: it discards state the undo journal would need, so no rollback
+    /// may follow.
+    ///
+    /// TODO(correctness): a comparison failure has to be an invariant violation
+    /// and has to happen on every node, or replays diverge. Audit the `equals`
+    /// error paths and make the ones that are not unreachable.
+    ///
+    /// # Safety
+    ///
+    /// Every entry's pointers hold initialized values of the type at its key.
+    pub(crate) unsafe fn drop_unchanged_writes<T: LayoutProvider + ?Sized>(
+        &mut self,
+        layouts: &T,
+    ) -> VMResult<()> {
+        for (key, entry) in self.entries.iter_mut() {
+            let (
+                &StorageRead::ExternalHeap { ptr: read, .. },
+                StorageWrite::LocalHeap { ptr: write, .. },
+            ) = (&entry.read, entry.write)
+            else {
+                continue;
+            };
+            // SAFETY: forwarded from this function's contract.
+            if unsafe { equals(layouts, read.as_ptr(), write.as_ptr(), key.value_ty()) }? {
+                entry.write = StorageWrite::NotModified;
+            }
+        }
+        Ok(())
+    }
+
     /// Save the current state and advance the epoch. A subsequent roll back
     /// can return here.
     pub fn checkpoint(&mut self) {
@@ -538,16 +583,19 @@ mod tests {
     use crate::{heap::Heap, write_object_header};
     use mono_move_alloc::GlobalArenaPtr;
     use mono_move_core::{
-        storage::resource_provider::ResourceProviderError, types::Type, DescriptorId,
-        OBJECT_HEADER_SIZE,
+        storage::resource_provider::ResourceProviderError, types::Type, DescriptorId, ReadPin,
+        ValueLayoutTable, OBJECT_HEADER_SIZE,
     };
     use move_core_types::account_address::AccountAddress;
+    use std::sync::Arc;
 
     // An `InternedType` is just an arena pointer; a `'static` node gives a
     // stable, cheap one without standing up an interner. Two distinct types let
     // us check that keys discriminate on type, not only address.
     static TY_A: Type = Type::U64;
     static TY_B: Type = Type::Bool;
+    // A type parameter has no reserved layout, so a comparison on it fails.
+    static TY_C: Type = Type::TypeParam { idx: 0 };
 
     fn addr(n: u8) -> AccountAddress {
         let mut bytes = [0u8; AccountAddress::LENGTH];
@@ -569,6 +617,13 @@ mod tests {
         }
     }
 
+    fn key_c(n: u8) -> InMemoryStorageKey {
+        InMemoryStorageKey::Resource {
+            address: addr(n),
+            ty: GlobalArenaPtr::from_static(&TY_C),
+        }
+    }
+
     // The map only stores and compares these pointers, never reading through
     // them, so any distinct non-null address works. Real allocation rather than
     // an integer cast, which `-Zmiri-strict-provenance` rejects.
@@ -579,6 +634,20 @@ mod tests {
         // SAFETY: `n` is within the backing allocation, as just asserted.
         let ptr = unsafe { backing.as_ptr().add(n) as *mut u8 };
         NonNull::new(ptr).expect("non-null")
+    }
+
+    // The tests only store and compare read pointers, never dereferencing them,
+    // so a zero-sized stand-in keeps each external read's value graph nominally
+    // alive without a real heap.
+    struct TestPin;
+    impl ReadPin for TestPin {}
+
+    fn ext_read(ptr: NonNull<u8>) -> StorageRead {
+        StorageRead::ExternalHeap {
+            ptr,
+            version: 0,
+            pin: Arc::new(TestPin),
+        }
     }
 
     /// Minimal in-crate provider: keys present here are external (committed)
@@ -607,7 +676,7 @@ mod tests {
             _group: Option<InternedType>,
         ) -> Result<StorageRead, ResourceProviderError> {
             Ok(match self.external.get(key) {
-                Some(&ptr) => StorageRead::ExternalHeap { ptr, version: 0 },
+                Some(&ptr) => ext_read(ptr),
                 None => StorageRead::DoesNotExist,
             })
         }
@@ -628,11 +697,7 @@ mod tests {
         let p = fake_ptr(0x10);
         // An unmodified entry follows its read.
         assert!(!entry(StorageRead::DoesNotExist, StorageWrite::NotModified).exists());
-        assert!(entry(
-            StorageRead::ExternalHeap { ptr: p, version: 0 },
-            StorageWrite::NotModified
-        )
-        .exists());
+        assert!(entry(ext_read(p), StorageWrite::NotModified).exists());
         // A local write means present, regardless of the read.
         assert!(entry(StorageRead::DoesNotExist, StorageWrite::LocalHeap {
             ptr: p,
@@ -640,11 +705,7 @@ mod tests {
         })
         .exists());
         // Deletion shadows any read.
-        assert!(!entry(
-            StorageRead::ExternalHeap { ptr: p, version: 0 },
-            StorageWrite::Deleted { epoch: 0 }
-        )
-        .exists());
+        assert!(!entry(ext_read(p), StorageWrite::Deleted { epoch: 0 }).exists());
     }
 
     #[test]
@@ -654,14 +715,7 @@ mod tests {
         // An external read hands back the provider's pointer unchanged — the
         // zero-copy read path.
         assert_eq!(
-            entry(
-                StorageRead::ExternalHeap {
-                    ptr: ext,
-                    version: 0
-                },
-                StorageWrite::NotModified
-            )
-            .as_ptr(),
+            entry(ext_read(ext), StorageWrite::NotModified).as_ptr(),
             Some(ext)
         );
         assert_eq!(
@@ -677,14 +731,7 @@ mod tests {
             None
         );
         assert_eq!(
-            entry(
-                StorageRead::ExternalHeap {
-                    ptr: ext,
-                    version: 0
-                },
-                StorageWrite::Deleted { epoch: 0 }
-            )
-            .as_ptr(),
+            entry(ext_read(ext), StorageWrite::Deleted { epoch: 0 }).as_ptr(),
             None
         );
     }
@@ -695,11 +742,7 @@ mod tests {
         let local = fake_ptr(0x31);
         // An external read is never directly writable — it needs a copy.
         assert!(matches!(
-            entry(
-                StorageRead::ExternalHeap { ptr: ext, version: 0 },
-                StorageWrite::NotModified
-            )
-            .as_ptr_mut(0),
+            entry(ext_read(ext), StorageWrite::NotModified).as_ptr_mut(0),
             Some(EntryPtr::NonWritable(p)) if p == ext
         ));
         // A local write in the current epoch is writable in place.
@@ -1039,16 +1082,18 @@ mod tests {
 
     // -- Write classification -------------------------------------------------
 
+    /// Unlike `fake_ptr`, this points at a value a comparison can read.
+    fn u64_ptr(slot: &u64) -> NonNull<u8> {
+        NonNull::from(slot).cast()
+    }
+
     fn class_of(read: StorageRead, write: StorageWrite) -> Option<WriteClass> {
         entry(read, write).write_class()
     }
 
     #[test]
     fn write_class_covers_the_read_write_matrix() {
-        let ext = || StorageRead::ExternalHeap {
-            ptr: fake_ptr(0x10),
-            version: 0,
-        };
+        let ext = || ext_read(fake_ptr(0x10));
         let local = || StorageWrite::LocalHeap {
             ptr: fake_ptr(0x11),
             epoch: 0,
@@ -1075,6 +1120,57 @@ mod tests {
         ));
         // Published then removed within the txn: net no-op, not a write.
         assert!(class_of(StorageRead::DoesNotExist, deleted()).is_none());
+    }
+
+    /// Borrows `key` mutably over a stored `before`, commits `copy` as the
+    /// local value, prunes, and returns how many writes survive.
+    fn writes_after_pruning(key: &InMemoryStorageKey, before: &u64, copy: &u64) -> VMResult<usize> {
+        let provider = Provider::with(key, u64_ptr(before));
+        let mut rws = ResourceReadWriteSet::new();
+        let _ = rws.try_borrow_global_mut(&provider, key, None).unwrap();
+        rws.commit_borrow_global_mut(key, u64_ptr(copy));
+
+        let layouts = ValueLayoutTable::new();
+        // SAFETY: both pointers hold a live `u64`. For a key whose type has no
+        // layout the comparison fails before either is read.
+        unsafe { rws.drop_unchanged_writes(&layouts) }?;
+        Ok(rws.writes_unordered().count())
+    }
+
+    #[test]
+    fn pruning_drops_a_local_copy_equal_to_the_read() {
+        assert_eq!(writes_after_pruning(&key_a(1), &7, &7).unwrap(), 0);
+        assert_eq!(writes_after_pruning(&key_a(1), &7, &8).unwrap(), 1);
+    }
+
+    #[test]
+    fn pruning_leaves_creations_and_deletions_alone() {
+        let value = 7u64;
+        let mut rws = ResourceReadWriteSet::new();
+        rws.entries.insert(
+            key_a(1),
+            entry(StorageRead::DoesNotExist, StorageWrite::LocalHeap {
+                ptr: u64_ptr(&value),
+                epoch: 0,
+            }),
+        );
+        rws.entries.insert(
+            key_a(2),
+            entry(ext_read(u64_ptr(&value)), StorageWrite::Deleted {
+                epoch: 0,
+            }),
+        );
+
+        let layouts = ValueLayoutTable::new();
+        // SAFETY: every pointer holds a live `u64`, which is `TY_A`.
+        unsafe { rws.drop_unchanged_writes(&layouts) }.unwrap();
+        assert_eq!(rws.writes_unordered().count(), 2);
+    }
+
+    #[test]
+    fn pruning_fails_on_a_comparison_it_cannot_decide() {
+        // Both sides hold the same value, so only the missing layout can fail.
+        assert!(writes_after_pruning(&key_c(1), &7, &7).is_err());
     }
 
     // -- GC scan --------------------------------------------------------------
@@ -1106,10 +1202,7 @@ mod tests {
         let ext = fake_ptr(0xDEAD);
         let mut rws = ResourceReadWriteSet::new();
         rws.entries.insert(k_ext.clone(), Entry {
-            read: StorageRead::ExternalHeap {
-                ptr: ext,
-                version: 0,
-            },
+            read: ext_read(ext),
             write: StorageWrite::NotModified,
             group: None,
         });

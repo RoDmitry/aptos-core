@@ -23,7 +23,10 @@ use crate::{
             storage::interface::RandStorage,
             types::{AugmentedData, RandConfig, Share},
         },
-        secret_sharing::{secret_share_manager::SecretShareManager, verifier::SecretShareVerifier},
+        secret_sharing::{
+            secret_share_manager::SecretShareManager, storage::SecretShareStorage,
+            verifier::SecretShareVerifier,
+        },
     },
     state_computer::ExecutionProxy,
     state_replication::StateComputer,
@@ -191,6 +194,7 @@ pub struct ExecutionProxyClient {
     // channels to buffer manager
     handle: Arc<RwLock<BufferManagerHandle>>,
     rand_storage: Arc<dyn RandStorage<AugmentedData>>,
+    secret_share_storage: Arc<dyn SecretShareStorage>,
     consensus_observer_config: ConsensusObserverConfig,
     consensus_publisher: Option<Arc<ConsensusPublisher>>,
 }
@@ -204,6 +208,7 @@ impl ExecutionProxyClient {
         network_sender: ConsensusNetworkClient<NetworkClient<ConsensusMsg>>,
         bounded_executor: BoundedExecutor,
         rand_storage: Arc<dyn RandStorage<AugmentedData>>,
+        secret_share_storage: Arc<dyn SecretShareStorage>,
         consensus_observer_config: ConsensusObserverConfig,
         consensus_publisher: Option<Arc<ConsensusPublisher>>,
     ) -> Self {
@@ -216,6 +221,7 @@ impl ExecutionProxyClient {
             bounded_executor,
             handle: Arc::new(RwLock::new(BufferManagerHandle::new())),
             rand_storage,
+            secret_share_storage,
             consensus_observer_config,
             consensus_publisher,
         }
@@ -286,12 +292,22 @@ impl ExecutionProxyClient {
         let (reset_tx_to_secret_share_manager, reset_secret_share_manager_rx) =
             unbounded::<ResetRequest>();
 
+        let state_sync_round_gap = self.consensus_config.max_commit_gap.max(
+            self.consensus_config
+                .vote_back_pressure_limit
+                .saturating_mul(2),
+        );
+        let retention_rounds = state_sync_round_gap.saturating_mul(2);
+
         let secret_share_manager = SecretShareManager::new(
             self.author,
             epoch_state.clone(),
             verifier,
             secret_ready_block_tx,
             network_sender.clone(),
+            self.secret_share_storage.clone(),
+            highest_committed_round,
+            retention_rounds,
             self.bounded_executor.clone(),
             &self.consensus_config.secret_share_rb_config,
             self.consensus_config.secret_share_request_delay_ms,
@@ -387,7 +403,6 @@ impl ExecutionProxyClient {
         rand_msg_rx: aptos_channel::Receiver<AccountAddress, IncomingRandGenRequest>,
         secret_sharing_msg_rx: aptos_channel::Receiver<AccountAddress, IncomingSecretShareRequest>,
         highest_committed_round: Round,
-        buffer_manager_back_pressure_enabled: bool,
         consensus_observer_config: ConsensusObserverConfig,
         consensus_publisher: Option<Arc<ConsensusPublisher>>,
         network_sender: Arc<NetworkSender>,
@@ -509,7 +524,6 @@ impl ExecutionProxyClient {
             epoch_state,
             self.bounded_executor.clone(),
             onchain_consensus_config.order_vote_enabled(),
-            buffer_manager_back_pressure_enabled,
             highest_committed_round,
             consensus_observer_config,
             consensus_publisher,
@@ -560,7 +574,6 @@ impl TExecutionClient for ExecutionProxyClient {
             rand_msg_rx,
             secret_sharing_msg_rx,
             highest_committed_round,
-            self.consensus_config.enable_pre_commit,
             self.consensus_observer_config,
             self.consensus_publisher.clone(),
             network_sender.clone(),

@@ -71,6 +71,13 @@
 //! one operation family whose only difference is the range consulted, so the
 //! type is always carried.
 
+pub mod ast;
+/// The producer of the typed-AST format from a move-model `GlobalEnv`.
+pub mod dump;
+pub use dump::dump_ast_module;
+/// Selection of the modules an export carries.
+pub mod select;
+pub use select::{module_closure, select_modules};
 pub mod check;
 
 use serde::{Deserialize, Serialize};
@@ -83,8 +90,10 @@ pub const XIR_SCHEMA: &str = "move-xir-module";
 /// Current version of the deployable XIR module wrapper. Version 3 adds the
 /// `is_native` function flag and permits bodyless native declarations;
 /// version 4 transports source spans for declarations and stackless code;
-/// version 5 adds user-facing local names.
-pub const XIR_VERSION: u64 = 5;
+/// version 5 adds user-facing local names; version 6 adds the external struct
+/// table; version 7 adds struct visibility; version 8 adds function types and
+/// the closure operations.
+pub const XIR_VERSION: u64 = 8;
 
 /// Index of a local of a function (a `LocalIndex` in move-model terms).
 /// Parameters come first.
@@ -161,6 +170,12 @@ pub struct XirModule {
     /// the local function count.
     #[serde(default)]
     pub external_functions: Vec<XirExternalFunction>,
+    /// Structs and enums of other modules whose types this module mentions.
+    /// Struct ids greater than or equal to `structs.len()` index this table
+    /// after subtracting the local struct count.  Only the type is referenced:
+    /// its declaration belongs to the other module.
+    #[serde(default)]
+    pub external_structs: Vec<XirExternalStruct>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,13 +186,21 @@ pub struct XirExternalFunction {
     pub function: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XirExternalStruct {
+    pub address: String,
+    pub module: String,
+    pub name: String,
+}
+
 impl XirModule {
     /// Checks the deployable wrapper's schema and version.
     pub fn check_version(&self) -> Result<(), String> {
         if self.schema != XIR_SCHEMA {
             return Err(format!("unsupported XIR schema `{}`", self.schema));
         }
-        if self.version != 3 && self.version != 4 && self.version != XIR_VERSION {
+        if !(3..=XIR_VERSION).contains(&self.version) {
             return Err(format!("unsupported XIR version {}", self.version));
         }
         Ok(())
@@ -203,6 +226,9 @@ pub enum XirDialect {
 #[serde(deny_unknown_fields)]
 pub struct XirStruct {
     pub name: String,
+    /// Absent means private, the only visibility before version 7.
+    #[serde(default)]
+    pub visibility: XirVisibility,
     #[serde(default)]
     pub abilities: Vec<String>,
     #[serde(default)]
@@ -299,9 +325,10 @@ pub enum XirAttributeArg {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum XirVisibility {
+    #[default]
     Private,
     Public,
     Friend,
@@ -501,6 +528,9 @@ pub enum Type {
     Ref(Box<Type>),
     /// `{"mut_ref": type}` — mutable reference.
     MutRef(Box<Type>),
+    /// `{"function": [[parameters], [results], [abilities]]}` — a function
+    /// value type.
+    Function(Vec<Type>, Vec<Type>, Vec<String>),
 }
 
 /// A declaration-scoped Move type parameter.
@@ -694,6 +724,14 @@ pub enum Oper {
     /// `{"function": fun}` — call a function of the same module.
     Function(FunId),
     FunctionInst(FunId, Vec<Type>),
+    /// `{"closure": [fun, mask]}` — build a function value of `fun` from the
+    /// operands, which are the captured arguments; bit `i` of `mask` marks
+    /// parameter `i` as captured.
+    Closure(FunId, u64),
+    ClosureInst(FunId, u64, Vec<Type>),
+    /// `"invoke"` — call the function value in the last operand with the
+    /// preceding operands.
+    Invoke,
     /// The reference operations below are transported for completeness;
     /// consumers may reject them (the Lean model executes them; verifying
     /// borrow-based code goes through its reference elimination).
@@ -707,6 +745,15 @@ pub enum Oper {
     /// `"borrow_vec_elem"` — borrow the element at a dynamic index
     /// (reference to a vector, index).
     BorrowVecElem,
+    /// `{"borrow_variant_field": [[variants], field]}` — borrow the field at
+    /// offset `field` of an enum referent that is one of the listed variants
+    /// (`Bytecode::BorrowVariantField`; aborts for any other variant).
+    BorrowVariantField(Vec<usize>, FieldOffset),
+    BorrowVariantFieldInst(Vec<usize>, FieldOffset, Vec<Type>),
+    /// `{"test_variant_ref": variant}` — test the variant of an enum
+    /// referent (`Bytecode::TestVariant` on a reference).
+    TestVariantRef(usize),
+    TestVariantRefInst(usize, Vec<Type>),
     ReadRef,
     WriteRef,
     FreezeRef,
@@ -1078,6 +1125,22 @@ mod tests {
             json!({"enum": 1})
         );
         assert_eq!(
+            serde_json::to_value(Type::Function(vec![Type::U64], vec![Type::Bool], vec![
+                "copy".to_string()
+            ]))
+            .unwrap(),
+            json!({"function": [["u64"], ["bool"], ["copy"]]})
+        );
+        assert_eq!(
+            serde_json::to_value(Oper::Closure(3, 2)).unwrap(),
+            json!({"closure": [3, 2]})
+        );
+        assert_eq!(
+            serde_json::to_value(Oper::ClosureInst(3, 2, vec![Type::U8])).unwrap(),
+            json!({"closure_inst": [3, 2, ["u8"]]})
+        );
+        assert_eq!(serde_json::to_value(Oper::Invoke).unwrap(), json!("invoke"));
+        assert_eq!(
             serde_json::to_value(Oper::PackVariant(2)).unwrap(),
             json!({"pack_variant": 2})
         );
@@ -1168,7 +1231,7 @@ mod tests {
 
     #[test]
     fn attribute_wire_shape() {
-        // Pin the exact wire shape produced by the Leaner XIR exporter.
+        // Pin the exact wire shape produced by the Verex XIR exporter.
         let json = json!({
             "name": "resource_group",
             "args": [

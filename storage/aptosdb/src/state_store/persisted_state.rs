@@ -1,9 +1,10 @@
 // Copyright (c) Aptos Foundation
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
-use crate::{metrics::OTHER_TIMERS_SECONDS, state_store::hot_state::HotState};
-use aptos_config::config::HotStateConfig;
-use aptos_crypto::HashValue;
+use crate::{
+    metrics::OTHER_TIMERS_SECONDS,
+    state_store::hot_state::{HotState, LoadedHotState},
+};
 use aptos_infallible::Mutex;
 use aptos_metrics_core::TimerHelper;
 use aptos_scratchpad::SUBTREE_DROPPER;
@@ -11,8 +12,6 @@ use aptos_storage_interface::state_store::{
     state::State, state_summary::StateSummary, state_view::hot_state_view::HotStateView,
     state_with_summary::StateWithSummary,
 };
-use aptos_types::state_store::{state_slot::StateSlot, NUM_STATE_SHARDS};
-use dashmap::DashMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -24,20 +23,10 @@ pub struct PersistedState {
 impl PersistedState {
     const MAX_PENDING_DROPS: usize = 8;
 
-    pub fn new_empty(config: HotStateConfig) -> Self {
-        let state = State::new_empty(config);
-        let hot_state = Arc::new(HotState::new(state, config));
-        let summary = Arc::new(Mutex::new(StateSummary::new_empty(config)));
-        Self { hot_state, summary }
-    }
-
-    pub fn new_from_loaded(
-        state: State,
-        config: HotStateConfig,
-        loaded_shards: [DashMap<HashValue, StateSlot>; NUM_STATE_SHARDS],
-    ) -> Self {
-        let hot_state = Arc::new(HotState::new_from_loaded(state, loaded_shards));
-        let summary = Arc::new(Mutex::new(StateSummary::new_empty(config)));
+    pub(crate) fn new(hot_state: LoadedHotState, summary: StateSummary) -> Self {
+        assert_eq!(hot_state.state().version(), summary.version());
+        let hot_state = Arc::new(HotState::new(hot_state));
+        let summary = Arc::new(Mutex::new(summary));
         Self { hot_state, summary }
     }
 
@@ -72,12 +61,5 @@ impl PersistedState {
         *self.summary.lock() = summary;
 
         self.hot_state.enqueue_commit(state);
-    }
-
-    // n.b. Can only be used when no on the fly commit is in the queue.
-    pub fn hack_reset(&self, state_with_summary: StateWithSummary) {
-        let (state, summary) = state_with_summary.into_inner();
-        *self.summary.lock() = summary;
-        self.hot_state.hack_reset(state);
     }
 }

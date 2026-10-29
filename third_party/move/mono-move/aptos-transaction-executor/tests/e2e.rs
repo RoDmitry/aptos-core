@@ -17,8 +17,12 @@
 use aptos_gas_schedule::{InitialGasSchedule, TransactionGasParameters};
 use aptos_language_e2e_tests::{account::AccountData, executor::FakeExecutor};
 use aptos_types::{
+    secret_sharing::EvalProof,
     state_store::StateView,
     transaction::{
+        encrypted_payload::{
+            DecryptedPlaintext, DecryptionFailureReason, EncryptedInner, EncryptedPayload,
+        },
         AuxiliaryInfo, ExecutionStatus, PersistedAuxiliaryInfo, SignedTransaction, Transaction,
         TransactionAuxiliaryData, TransactionOutput, TransactionStatus,
     },
@@ -28,8 +32,8 @@ use mono_move_aptos_state_view_providers::{StateViewModuleProvider, StateViewRes
 use mono_move_aptos_transaction_executor::{
     production_natives, AptosTransactionExecutor, TxnOutcome,
 };
-use mono_move_global_context::GlobalContext;
-use move_core_types::vm_status::StatusCode;
+use mono_move_global_context::{ExecutionGuard, GlobalContext};
+use move_core_types::{transaction_argument::TransactionArgument, vm_status::StatusCode};
 use std::collections::BTreeMap;
 
 /// Event types whose payload embeds gas amounts.
@@ -74,36 +78,76 @@ fn first_txn_aux_info() -> AuxiliaryInfo {
     )
 }
 
-/// Builds the executor against `state`, runs one transaction through it, and
-/// materializes the outcome.
+/// Builds the executor against `state` in a fresh global context, runs one
+/// transaction through it, and materializes the outcome.
 fn execute_v2_with<S: StateView>(
     state: &S,
-    run: impl for<'guard> FnOnce(&AptosTransactionExecutor<'guard>) -> TxnOutcome<'guard>,
+    run: impl for<'guard> FnOnce(&AptosTransactionExecutor<'guard>) -> TxnOutcome,
 ) -> TransactionOutput {
     let global_ctx = GlobalContext::with_num_execution_workers(1);
     let guard = global_ctx
         .try_execution_context(0)
         .expect("execution context is available");
-    let natives = production_natives(&guard);
+    execute_v2_in(&guard, state, run)
+}
+
+/// Like `execute_v2_with`, in an existing execution context.
+fn execute_v2_in<S: StateView>(
+    guard: &ExecutionGuard<'_>,
+    state: &S,
+    run: impl for<'guard> FnOnce(&AptosTransactionExecutor<'guard>) -> TxnOutcome,
+) -> TransactionOutput {
+    let natives = production_natives();
     let module_provider = StateViewModuleProvider::new(state);
-    let data_provider = StateViewResourceProvider::new(&guard, state);
+    let data_provider = StateViewResourceProvider::new(guard, state);
     let env = AptosEnvironment::new(state);
     let usage = state.get_usage().expect("usage is readable");
     let executor = AptosTransactionExecutor::new(
-        &guard,
-        &natives,
+        guard,
+        natives,
         &module_provider,
         &data_provider,
         &env,
         usage,
     );
-    run(&executor)
+    let (output, _groups) = run(&executor)
         .materialize(
+            guard,
             &data_provider,
             env.features(),
             TransactionAuxiliaryData::default(),
         )
-        .expect("the transaction output materializes")
+        .expect("the transaction output materializes");
+    output
+}
+
+/// Runs `txns` in order through one global context, applying each output to
+/// the state before the next.
+fn execute_v2_sequence<S: StateView + Sync>(
+    base: &S,
+    txns: &[SignedTransaction],
+) -> Vec<TransactionOutput> {
+    use aptos_transaction_simulation::{DeltaStateStore, SimulationStateStore};
+
+    let state = DeltaStateStore::new_with_base(base);
+    let global_ctx = GlobalContext::with_num_execution_workers(1);
+    let guard = global_ctx
+        .try_execution_context(0)
+        .expect("execution context is available");
+    let mut outputs = Vec::with_capacity(txns.len());
+    for txn in txns {
+        let output = execute_v2_in(&guard, &state, |executor| {
+            executor.execute_transaction(
+                &Transaction::UserTransaction(txn.clone()),
+                &AuxiliaryInfo::new(PersistedAuxiliaryInfo::None, None),
+            )
+        });
+        state
+            .apply_write_set(output.write_set())
+            .expect("write set applies");
+        outputs.push(output);
+    }
+    outputs
 }
 
 /// Fresh genesis with a funded sender (sequence number 10) and recipient.
@@ -401,17 +445,1136 @@ fn extra_signers_rejected_like_v1() {
     );
 
     let v2_output = execute_v2(fx.get_state_view(), &txn);
-    assert!(
-        matches!(
-            v2_output.status(),
-            TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(_))
-        ),
-        "v2 did not reject the signer-count mismatch: {:?}",
-        v2_output.status()
+    assert_eq!(
+        v2_output.status(),
+        v1_output.status(),
+        "v2 rejected the signer-count mismatch differently"
     );
 
     // Write sets are not compared: the gas divergence leaves v1 with fee
     // writes v2 lacks.
+}
+
+/// A script transaction from `sender`, with the script given as assembly.
+fn script_txn(
+    sender: &AccountData,
+    code: &str,
+    args: Vec<TransactionArgument>,
+    sequence_number: u64,
+) -> SignedTransaction {
+    let code = aptos_language_e2e_tests::compile::compile_script(code, vec![])
+        .code()
+        .to_vec();
+    script_bytes_txn(sender, code, args, sequence_number)
+}
+
+/// A script transaction from `sender`, with the script given as bytecode.
+fn script_bytes_txn(
+    sender: &AccountData,
+    code: Vec<u8>,
+    args: Vec<TransactionArgument>,
+    sequence_number: u64,
+) -> SignedTransaction {
+    use aptos_types::transaction::{Script, TransactionPayload};
+
+    sender
+        .account()
+        .transaction()
+        .payload(TransactionPayload::Script(Script::new(code, vec![], args)))
+        .sequence_number(sequence_number)
+        .gas_unit_price(100)
+        .max_gas_amount(1_000_000)
+        .sign()
+}
+
+/// A script transferring APT through the framework.
+const TRANSFER_SCRIPT: &str = r#"
+script
+use 0x1::aptos_account as account
+
+public fun main(sender: &signer, to: address, amount: u64)
+    move_loc sender
+    move_loc to
+    move_loc amount
+    call account::transfer
+    ret
+"#;
+
+/// Runs the transfer script with `amount` as its amount argument on both VMs
+/// and asserts they agree.
+fn assert_transfer_script_matches_v1(amount: TransactionArgument) {
+    let (fx, alice, bob) = setup();
+    let txn = script_txn(
+        &alice,
+        TRANSFER_SCRIPT,
+        vec![TransactionArgument::Address(*bob.address()), amount],
+        10,
+    );
+
+    let v1_output = fx.execute_transaction(txn.clone());
+    assert_eq!(
+        v1_output.status(),
+        &TransactionStatus::Keep(ExecutionStatus::Success),
+        "v1 rejected the script: {:?}",
+        v1_output.status()
+    );
+    let v2_output = execute_v2(fx.get_state_view(), &txn);
+    assert_eq!(v2_output.status(), v1_output.status());
+
+    compare_outputs(&v1_output, &v2_output, *alice.address());
+}
+
+/// A script payload runs like on v1, with the same effects.
+#[test]
+fn script_transfer_matches_v1() {
+    assert_transfer_script_matches_v1(TransactionArgument::U64(1_000));
+}
+
+/// A pre-serialized script argument is accepted like on v1.
+#[test]
+fn script_serialized_argument_matches_v1() {
+    assert_transfer_script_matches_v1(TransactionArgument::Serialized(
+        bcs::to_bytes(&1_000u64).unwrap(),
+    ));
+}
+
+/// A script's abort is located at the script, like on v1.
+#[test]
+fn script_abort_matches_v1() {
+    use move_core_types::vm_status::AbortLocation;
+
+    let (fx, alice, _bob) = setup();
+    let txn = script_txn(
+        &alice,
+        r#"
+script
+
+public fun main()
+    ld_u64 42
+    abort
+"#,
+        vec![],
+        10,
+    );
+
+    let v1_output = fx.execute_transaction(txn.clone());
+    assert!(
+        matches!(
+            v1_output.status(),
+            TransactionStatus::Keep(ExecutionStatus::MoveAbort {
+                location: AbortLocation::Script,
+                code: 42,
+                ..
+            })
+        ),
+        "v1 did not abort at the script: {:?}",
+        v1_output.status()
+    );
+    let v2_output = execute_v2(fx.get_state_view(), &txn);
+    assert_eq!(v2_output.status(), v1_output.status());
+
+    compare_outputs(&v1_output, &v2_output, *alice.address());
+}
+
+/// A script's parameters are checked like an entry function's. Without that
+/// check a `Coin` would be built straight from the argument bytes and could be
+/// deposited, minting it out of nothing.
+#[test]
+fn script_cannot_forge_a_coin_argument() {
+    let (fx, alice, _bob) = setup();
+    let txn = script_txn(
+        &alice,
+        r#"
+script
+use 0x1::coin
+use 0x1::aptos_coin
+use 0x1::signer
+
+public fun main(s: &signer, c: coin::Coin<aptos_coin::AptosCoin>)
+    move_loc s
+    call signer::address_of
+    move_loc c
+    call coin::deposit<aptos_coin::AptosCoin>
+    ret
+"#,
+        vec![TransactionArgument::Serialized(
+            bcs::to_bytes(&1_000_000u64).unwrap(),
+        )],
+        10,
+    );
+    assert_rejected_by_both(&fx, txn, StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE);
+}
+
+/// A script taking an `Object` of a non-resource is refused for its signature,
+/// not carried into the existence check, which has no resource to look for.
+#[test]
+fn script_object_argument_of_primitive_rejected() {
+    let (fx, alice, _bob) = setup();
+    let txn = script_txn(
+        &alice,
+        r#"
+script
+use 0x1::object
+
+public fun main(o: object::Object<u64>)
+    ret
+"#,
+        vec![TransactionArgument::Address(APT_METADATA_OBJECT)],
+        10,
+    );
+    assert_rejected_by_both(&fx, txn, StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE);
+}
+
+/// A script's runtime error is located at the script, like on v1.
+#[test]
+fn script_runtime_error_matches_v1() {
+    use move_core_types::vm_status::AbortLocation;
+
+    let (fx, alice, _bob) = setup();
+    let txn = script_txn(
+        &alice,
+        r#"
+script
+
+public fun main(divisor: u64)
+    ld_u64 1
+    move_loc divisor
+    div
+    pop
+    ret
+"#,
+        vec![TransactionArgument::U64(0)],
+        10,
+    );
+
+    let v1_output = fx.execute_transaction(txn.clone());
+    assert!(
+        matches!(
+            v1_output.status(),
+            TransactionStatus::Keep(ExecutionStatus::ExecutionFailure {
+                location: AbortLocation::Script,
+                ..
+            })
+        ),
+        "v1 did not fail at the script: {:?}",
+        v1_output.status()
+    );
+    let v2_output = execute_v2(fx.get_state_view(), &txn);
+    assert_eq!(v2_output.status(), v1_output.status());
+
+    compare_outputs(&v1_output, &v2_output, *alice.address());
+}
+
+/// A script that emits an event is refused with the same status as on v1.
+#[test]
+fn event_emitting_script_refused_like_v1() {
+    let (fx, alice, _bob) = setup();
+    let txn = script_txn(
+        &alice,
+        r#"
+script
+use 0x1::event
+
+public fun main()
+    ld_u64 1
+    call event::emit<u64>
+    ret
+"#,
+        vec![],
+        10,
+    );
+
+    let v1_output = fx.execute_transaction(txn.clone());
+    assert_eq!(
+        v1_output.status(),
+        &TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(Some(
+            StatusCode::INVALID_OPERATION_IN_SCRIPT
+        ))),
+        "v1 did not refuse the script: {:?}",
+        v1_output.status()
+    );
+    let v2_output = execute_v2(fx.get_state_view(), &txn);
+    assert_eq!(v2_output.status(), v1_output.status());
+
+    compare_outputs(&v1_output, &v2_output, *alice.address());
+}
+
+/// A script that does not deserialize is kept with the same status as on v1.
+#[test]
+fn undeserializable_script_kept_like_v1() {
+    let (fx, alice, _bob) = setup();
+    let txn = script_bytes_txn(&alice, vec![0xDE, 0xAD, 0xBE, 0xEF], vec![], 10);
+
+    let v1_output = fx.execute_transaction(txn.clone());
+    assert_eq!(
+        v1_output.status(),
+        &TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(Some(
+            StatusCode::CODE_DESERIALIZATION_ERROR
+        ))),
+        "v1 did not reject the script: {:?}",
+        v1_output.status()
+    );
+    let v2_output = execute_v2(fx.get_state_view(), &txn);
+    assert_eq!(v2_output.status(), v1_output.status());
+
+    // Write sets are not compared: the payload fails before anything is
+    // loaded, and v2 charges no intrinsic gas, so it writes no fee.
+}
+
+/// The same script run twice through one global context, hitting the script
+/// cache the second time, behaves like on v1 both times.
+#[test]
+fn script_cache_hit_matches_v1() {
+    let (mut fx, alice, bob) = setup();
+    let args = || {
+        vec![
+            TransactionArgument::Address(*bob.address()),
+            TransactionArgument::U64(1_000),
+        ]
+    };
+    let txns = [
+        script_txn(&alice, TRANSFER_SCRIPT, args(), 10),
+        script_txn(&alice, TRANSFER_SCRIPT, args(), 11),
+    ];
+
+    let v2_outputs = execute_v2_sequence(fx.get_state_view(), &txns);
+    for (txn, v2_output) in txns.iter().zip(&v2_outputs) {
+        let v1_output = fx.execute_and_apply(txn.clone());
+        assert_eq!(
+            v1_output.status(),
+            &TransactionStatus::Keep(ExecutionStatus::Success),
+            "v1 rejected the script: {:?}",
+            v1_output.status()
+        );
+        assert_eq!(v2_output.status(), v1_output.status());
+        compare_outputs(&v1_output, v2_output, *alice.address());
+    }
+}
+
+/// A transaction from `sender` calling `<address>::<module>::<function>` with
+/// no type arguments and the given BCS-encoded arguments.
+fn call_txn(
+    sender: &AccountData,
+    address: move_core_types::account_address::AccountAddress,
+    module: &str,
+    function: &str,
+    args: Vec<Vec<u8>>,
+) -> SignedTransaction {
+    call_txn_at(sender, address, module, function, args, 10)
+}
+
+/// Like `call_txn`, at the given sequence number.
+fn call_txn_at(
+    sender: &AccountData,
+    address: move_core_types::account_address::AccountAddress,
+    module: &str,
+    function: &str,
+    args: Vec<Vec<u8>>,
+    sequence_number: u64,
+) -> SignedTransaction {
+    generic_call_txn(
+        sender,
+        address,
+        module,
+        function,
+        vec![],
+        args,
+        sequence_number,
+    )
+}
+
+/// Like `call_txn_at`, with type arguments.
+fn generic_call_txn(
+    sender: &AccountData,
+    address: move_core_types::account_address::AccountAddress,
+    module: &str,
+    function: &str,
+    ty_args: Vec<move_core_types::language_storage::TypeTag>,
+    args: Vec<Vec<u8>>,
+    sequence_number: u64,
+) -> SignedTransaction {
+    use aptos_types::transaction::{EntryFunction, TransactionPayload};
+    use move_core_types::{identifier::Identifier, language_storage::ModuleId};
+
+    sender
+        .account()
+        .transaction()
+        .payload(TransactionPayload::EntryFunction(EntryFunction::new(
+            ModuleId::new(address, Identifier::new(module).unwrap()),
+            Identifier::new(function).unwrap(),
+            ty_args,
+            args,
+        )))
+        .sequence_number(sequence_number)
+        .gas_unit_price(100)
+        .max_gas_amount(1_000_000)
+        .sign()
+}
+
+/// Asserts that both VMs keep `txn` with the miscellaneous error `code` and
+/// agree, modulo gas, on the output.
+fn assert_kept_with_code_like_v1(
+    fx: &FakeExecutor,
+    sender: &AccountData,
+    txn: SignedTransaction,
+    code: StatusCode,
+) {
+    let output = assert_output_matches_v1(fx, &txn, *sender.address());
+    assert_eq!(
+        output.status(),
+        &TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(Some(code))),
+        "v1 did not keep the transaction with {code:?}"
+    );
+}
+
+/// Entry functions with signatures a transaction may not call. Assembled from
+/// MASM, since the framework has none and the Move compiler would refuse some.
+const UNCALLABLE_ENTRY_FUNCTIONS: &str = r#"
+module 0xcafe::uncallable
+use 0x1::option
+
+struct Private has drop
+  x: u64
+
+entry public fun returns_value(): u64
+    ld_u64 0
+    ret
+
+entry public fun takes_ref(x: &u64)
+    ret
+
+entry public fun signer_after_arg(x: u64, s: &signer)
+    ret
+
+entry public fun takes_option_of_private(o: option::Option<Private>)
+    ret
+"#;
+
+/// Entry functions taking the framework types a transaction argument may
+/// construct, so their values can be checked.
+const CALLABLE_ENTRY_FUNCTIONS: &str = r#"
+module 0xcafe::callable
+use 0x1::string
+use 0x1::option
+use 0x1::object
+use 0x1::fungible_asset
+
+entry public fun takes_string(s: string::String)
+    ret
+
+entry public fun takes_option_string(o: option::Option<string::String>)
+    ret
+
+entry public fun takes_strings(v: vector<string::String>)
+    ret
+
+entry public fun takes_object(o: object::Object<object::ObjectCore>)
+    ret
+
+entry public fun takes_store_object(o: object::Object<fungible_asset::FungibleStore>)
+    ret
+
+entry public fun takes_option_u64(o: option::Option<u64>)
+    ret
+
+entry public fun takes_object_of_primitive(o: object::Object<u64>)
+    ret
+
+entry public fun takes_object_generic<T>(o: object::Object<T>)
+    ret
+"#;
+
+/// Publishes a MASM module straight into the test state, returning its
+/// address.
+fn publish_module(
+    fx: &mut FakeExecutor,
+    source: &str,
+) -> move_core_types::account_address::AccountAddress {
+    let (module, blob) = aptos_language_e2e_tests::compile::compile_module(source);
+    fx.add_module(&module.self_id(), blob.into_inner());
+    *module.self_id().address()
+}
+
+/// Publishes `UNCALLABLE_ENTRY_FUNCTIONS` straight into `fx`'s state,
+/// returning the module's address.
+fn publish_uncallable_module(
+    fx: &mut FakeExecutor,
+) -> move_core_types::account_address::AccountAddress {
+    publish_module(fx, UNCALLABLE_ENTRY_FUNCTIONS)
+}
+
+/// Asserts that both VMs refuse the transaction, v1 with any failure and v2
+/// with the given error. Used where v1 aborts in a framework constructor and
+/// v2 reports its own status instead.
+fn assert_rejected_by_both(fx: &FakeExecutor, txn: SignedTransaction, code: StatusCode) {
+    let v1_output = fx.execute_transaction(txn.clone());
+    assert!(
+        matches!(
+            v1_output.status(),
+            TransactionStatus::Keep(status) if !matches!(status, ExecutionStatus::Success)
+        ),
+        "v1 did not refuse the transaction: {:?}",
+        v1_output.status()
+    );
+
+    let v2_output = execute_v2(fx.get_state_view(), &txn);
+    assert_eq!(
+        v2_output.status(),
+        &TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(Some(code)))
+    );
+}
+
+/// Runs the transaction on v1, returning its output.
+fn assert_v1_succeeds(fx: &FakeExecutor, txn: &SignedTransaction) -> TransactionOutput {
+    let v1_output = fx.execute_transaction(txn.clone());
+    assert_eq!(
+        v1_output.status(),
+        &TransactionStatus::Keep(ExecutionStatus::Success),
+        "v1 refused the transaction: {:?}",
+        v1_output.status()
+    );
+    v1_output
+}
+
+/// Asserts that both VMs run the transaction successfully with the same
+/// effects.
+fn assert_succeeds_like_v1(fx: &FakeExecutor, sender: &AccountData, txn: SignedTransaction) {
+    let v1_output = assert_v1_succeeds(fx, &txn);
+    let v2_output = execute_v2(fx.get_state_view(), &txn);
+    assert_eq!(v2_output.status(), v1_output.status());
+
+    compare_outputs(&v1_output, &v2_output, *sender.address());
+}
+
+/// A public function that is not `entry` is refused like on v1.
+#[test]
+fn non_entry_function_rejected_like_v1() {
+    use move_core_types::account_address::AccountAddress;
+
+    let (fx, alice, bob) = setup();
+    let txn = call_txn(
+        &alice,
+        AccountAddress::ONE,
+        "aptos_governance",
+        "assert_proposal_expiration",
+        vec![
+            bcs::to_bytes(bob.address()).unwrap(),
+            bcs::to_bytes(&0u64).unwrap(),
+        ],
+    );
+    assert_kept_with_code_like_v1(
+        &fx,
+        &alice,
+        txn,
+        StatusCode::EXECUTE_ENTRY_FUNCTION_CALLED_ON_NON_ENTRY_FUNCTION,
+    );
+}
+
+/// An entry function that returns values is refused like on v1.
+#[test]
+fn returning_function_rejected_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_uncallable_module(&mut fx);
+    let txn = call_txn(&alice, address, "uncallable", "returns_value", vec![]);
+    assert_kept_with_code_like_v1(
+        &fx,
+        &alice,
+        txn,
+        StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE,
+    );
+}
+
+/// An entry function with a reference parameter is refused like on v1.
+#[test]
+fn reference_parameter_rejected_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_uncallable_module(&mut fx);
+    let txn = call_txn(&alice, address, "uncallable", "takes_ref", vec![
+        bcs::to_bytes(&0u64).unwrap(),
+    ]);
+    assert_kept_with_code_like_v1(
+        &fx,
+        &alice,
+        txn,
+        StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE,
+    );
+}
+
+/// An entry function whose signer parameter follows another parameter is
+/// refused like on v1.
+#[test]
+fn signer_after_argument_rejected_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_uncallable_module(&mut fx);
+    let txn = call_txn(&alice, address, "uncallable", "signer_after_arg", vec![
+        bcs::to_bytes(&0u64).unwrap(),
+    ]);
+    assert_kept_with_code_like_v1(
+        &fx,
+        &alice,
+        txn,
+        StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE,
+    );
+}
+
+/// An entry function taking an `Option` of a private struct is refused like on
+/// v1.
+#[test]
+fn option_of_private_struct_rejected_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_uncallable_module(&mut fx);
+    // `Some(Private { x: 0 })`: v1 admits the type but fails to construct the
+    // value, so it would accept a `None`.
+    let txn = call_txn(
+        &alice,
+        address,
+        "uncallable",
+        "takes_option_of_private",
+        vec![bcs::to_bytes(&vec![0u64]).unwrap()],
+    );
+    assert_kept_with_code_like_v1(
+        &fx,
+        &alice,
+        txn,
+        StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE,
+    );
+}
+
+/// A native function is refused like on v1.
+#[test]
+fn native_function_rejected_like_v1() {
+    use move_core_types::account_address::AccountAddress;
+
+    let (fx, alice, _bob) = setup();
+    let txn = call_txn(&alice, AccountAddress::ONE, "hash", "sha2_256", vec![
+        bcs::to_bytes(&vec![1u8, 2, 3]).unwrap(),
+    ]);
+    assert_kept_with_code_like_v1(
+        &fx,
+        &alice,
+        txn,
+        StatusCode::USER_DEFINED_NATIVE_NOT_ALLOWED,
+    );
+}
+
+/// A `String` argument that is valid UTF-8 runs like on v1.
+#[test]
+fn valid_string_argument_accepted_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, CALLABLE_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "callable", "takes_string", vec![
+        bcs::to_bytes("hello").unwrap(),
+    ]);
+    assert_succeeds_like_v1(&fx, &alice, txn);
+}
+
+/// A `String` argument that is not valid UTF-8 is refused. v1 aborts in
+/// `string::utf8`; v2 faults the argument.
+#[test]
+fn malformed_string_argument_rejected() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, CALLABLE_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "callable", "takes_string", vec![
+        bcs::to_bytes(&[0xFFu8, 0xFE].as_slice()).unwrap(),
+    ]);
+    assert_rejected_by_both(&fx, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
+}
+
+/// A malformed `String` nested in `Some` is refused.
+#[test]
+fn malformed_string_in_option_rejected() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, CALLABLE_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "callable", "takes_option_string", vec![
+        bcs::to_bytes(&Some([0xFFu8, 0xFE].as_slice())).unwrap(),
+    ]);
+    assert_rejected_by_both(&fx, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
+}
+
+/// A malformed `String` nested in a vector is refused, past valid elements.
+#[test]
+fn malformed_string_in_vector_rejected() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, CALLABLE_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "callable", "takes_strings", vec![
+        bcs::to_bytes(&[b"ok".as_slice(), [0xFFu8].as_slice()]).unwrap(),
+    ]);
+    assert_rejected_by_both(&fx, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
+}
+
+/// An `Object<T>` argument naming an address with no object is refused. v1
+/// aborts in `object::address_to_object`; v2 faults the argument.
+#[test]
+fn object_argument_without_object_rejected() {
+    let (mut fx, alice, bob) = setup();
+    let address = publish_module(&mut fx, CALLABLE_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "callable", "takes_object", vec![
+        bcs::to_bytes(bob.address()).unwrap(),
+    ]);
+    assert_rejected_by_both(&fx, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
+}
+
+/// The APT fungible-asset metadata object genesis creates.
+const APT_METADATA_OBJECT: move_core_types::account_address::AccountAddress =
+    move_core_types::account_address::AccountAddress::TEN;
+
+/// An `Object<T>` argument naming an object holding a `T` runs like on v1.
+#[test]
+fn object_argument_accepted_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, CALLABLE_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "callable", "takes_object", vec![
+        bcs::to_bytes(&APT_METADATA_OBJECT).unwrap(),
+    ]);
+    assert_succeeds_like_v1(&fx, &alice, txn);
+}
+
+/// The layout cache outlives a transaction but the read set does not, so a
+/// second transaction checking the same `Object<T>` must still record `T`'s
+/// defining module. `T` comes from the transaction's type arguments and is
+/// phantom, so nothing but the check itself loads that module.
+#[test]
+fn repeated_object_argument_rejected_the_same_way() {
+    use move_core_types::language_storage::{StructTag, TypeTag};
+
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, CALLABLE_ENTRY_FUNCTIONS);
+    // A resource nothing else in the transaction refers to, so only the
+    // argument check loads its module.
+    publish_module(
+        &mut fx,
+        r#"
+module 0xcafe::res
+
+struct R has key
+  v: u64
+"#,
+    );
+    let store = TypeTag::Struct(Box::new(StructTag {
+        address,
+        module: move_core_types::identifier::Identifier::new("res").unwrap(),
+        name: move_core_types::identifier::Identifier::new("R").unwrap(),
+        type_args: vec![],
+    }));
+    let txn = |sequence_number| {
+        generic_call_txn(
+            &alice,
+            address,
+            "callable",
+            "takes_object_generic",
+            vec![store.clone()],
+            vec![bcs::to_bytes(&APT_METADATA_OBJECT).unwrap()],
+            sequence_number,
+        )
+    };
+
+    for v2_output in execute_v2_sequence(fx.get_state_view(), &[txn(10), txn(11)]) {
+        assert_eq!(
+            v2_output.status(),
+            &TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(Some(
+                StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT
+            ))),
+        );
+    }
+}
+
+/// An `Object<T>` argument naming an object without a `T` is refused.
+#[test]
+fn object_argument_without_resource_rejected() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, CALLABLE_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "callable", "takes_store_object", vec![
+        bcs::to_bytes(&APT_METADATA_OBJECT).unwrap(),
+    ]);
+    assert_rejected_by_both(&fx, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
+}
+
+/// A chain of public structs where each one holds two vectors of the next.
+/// The type graph is `depth` nodes, but the paths through it are `2^depth`,
+/// so a check that does not remember the types it has decided never finishes.
+fn shared_field_chain(depth: usize) -> String {
+    let mut source = String::from("module 0xcafe::deep\n\nstruct D0 has copy+drop\n  a: u64\n\n");
+    source.push_str(
+        "#[pack] public fun pack$D0(l0: u64): D0\n    move_loc l0\n    pack D0\n    ret\n\n",
+    );
+    for level in 1..=depth {
+        let prev = level - 1;
+        source.push_str(&format!(
+            "struct D{level} has copy+drop\n  a: vector<D{prev}>\n  b: vector<D{prev}>\n\n\
+             #[pack] public fun pack$D{level}(l0: vector<D{prev}>, l1: vector<D{prev}>): D{level}\n    \
+             move_loc l0\n    move_loc l1\n    pack D{level}\n    ret\n\n"
+        ));
+    }
+    source.push_str(&format!(
+        "entry public fun takes_deep(d: D{depth})\n    ret\n"
+    ));
+    source
+}
+
+/// A type whose fields share types is decided once per type, not once per
+/// path to it.
+#[test]
+fn shared_field_chain_accepted_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, &shared_field_chain(28));
+    // `D28` is two empty vectors.
+    let txn = call_txn(&alice, address, "deep", "takes_deep", vec![vec![0u8, 0]]);
+    assert_succeeds_like_v1(&fx, &alice, txn);
+}
+
+/// A public struct whose field is a function value is refused: a transaction
+/// cannot supply one, and it shares a layout that names no type.
+#[test]
+fn public_struct_with_function_field_rejected() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "pubs", "takes_closured", vec![vec![]]);
+    assert_rejected_by_both(&fx, txn, StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE);
+}
+
+/// `Object<T>` puts no ability bound on `T`, so a primitive `T` is a legal
+/// signature. Only a resource can sit under an object's address, so the
+/// parameter type is refused rather than looked up.
+#[test]
+fn object_argument_of_primitive_rejected() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, CALLABLE_ENTRY_FUNCTIONS);
+    let txn = call_txn(
+        &alice,
+        address,
+        "callable",
+        "takes_object_of_primitive",
+        vec![bcs::to_bytes(&APT_METADATA_OBJECT).unwrap()],
+    );
+    assert_rejected_by_both(&fx, txn, StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE);
+}
+
+/// An `Option` holding two values is refused. v1 aborts in
+/// `option::from_vec`; v2 rejects the enum tag while decoding.
+#[test]
+fn overlong_option_argument_rejected() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, CALLABLE_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "callable", "takes_option_u64", vec![
+        bcs::to_bytes(&[7u64, 8]).unwrap(),
+    ]);
+    assert_rejected_by_both(&fx, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
+}
+
+/// Public structs and enums, packed through their pack functions, and the
+/// shapes that disqualify one: no pack function, a missing variant pack
+/// function, `key`, no `copy`, and a field of a disqualified type.
+const PUBLIC_STRUCT_ENTRY_FUNCTIONS: &str = r#"
+module 0xcafe::pubs
+use 0x1::string
+use 0x1::option
+use 0x1::object
+
+struct Bar has copy+drop
+  n: u64
+
+struct Foo has copy+drop
+  x: string::String
+  y: Bar
+
+enum Shape has copy+drop
+  Circle
+    r: u64
+  Label
+    s: string::String
+
+enum Partial has copy+drop
+  A
+    v: u64
+  B
+    w: u64
+
+struct Private has copy+drop
+  v: u64
+
+struct Keyed has key+copy+drop
+  v: u64
+
+struct NoCopy has drop
+  v: u64
+
+struct Box<T: copy+drop> has copy+drop
+  t: T
+
+struct Closured has copy+drop
+  f: |u64|u64 has copy+drop
+
+#[pack] public fun pack$Bar(l0: u64): Bar
+    move_loc l0
+    pack Bar
+    ret
+
+#[pack] public fun pack$Foo(l0: string::String, l1: Bar): Foo
+    move_loc l0
+    move_loc l1
+    pack Foo
+    ret
+
+#[pack_variant(0)] public fun pack$Shape$Circle(l0: u64): Shape
+    move_loc l0
+    pack_variant Shape, Circle
+    ret
+
+#[pack_variant(1)] public fun pack$Shape$Label(l0: string::String): Shape
+    move_loc l0
+    pack_variant Shape, Label
+    ret
+
+#[pack_variant(0)] public fun pack$Partial$A(l0: u64): Partial
+    move_loc l0
+    pack_variant Partial, A
+    ret
+
+#[pack] public fun pack$NoCopy(l0: u64): NoCopy
+    move_loc l0
+    pack NoCopy
+    ret
+
+#[pack] public fun pack$Box<T: copy+drop>(l0: T): Box<T>
+    move_loc l0
+    pack Box<T>
+    ret
+
+#[pack] public fun pack$Closured(l0: |u64|u64 has copy+drop): Closured
+    move_loc l0
+    pack Closured
+    ret
+
+entry public fun takes_foo(f: Foo)
+    ret
+
+entry public fun takes_foos(v: vector<Foo>)
+    ret
+
+entry public fun takes_opt_foo(o: option::Option<Foo>)
+    ret
+
+entry public fun takes_shape(s: Shape)
+    ret
+
+entry public fun takes_partial(p: Partial)
+    ret
+
+entry public fun takes_private(p: Private)
+    ret
+
+entry public fun takes_keyed(k: Keyed)
+    ret
+
+entry public fun takes_nocopy(n: NoCopy)
+    ret
+
+entry public fun takes_box_string(b: Box<string::String>)
+    ret
+
+entry public fun takes_box_private(b: Box<Private>)
+    ret
+
+entry public fun takes_boxed_objects(v: vector<Box<object::Object<object::ObjectCore>>>)
+    ret
+
+entry public fun takes_closured(c: Closured)
+    ret
+"#;
+
+/// Asserts that v1 runs `txn` successfully while v2 keeps it with the
+/// miscellaneous error `code`: the cases where v2 is deliberately stricter.
+fn assert_v1_runs_but_v2_rejects(fx: &FakeExecutor, txn: SignedTransaction, code: StatusCode) {
+    assert_v1_succeeds(fx, &txn);
+    let v2_output = execute_v2(fx.get_state_view(), &txn);
+    assert_eq!(
+        v2_output.status(),
+        &TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(Some(code)))
+    );
+}
+
+/// `Foo { x: "hi", y: Bar { n: 7 } }`.
+fn valid_foo() -> Vec<u8> {
+    [bcs::to_bytes("hi").unwrap(), bcs::to_bytes(&7u64).unwrap()].concat()
+}
+
+/// `Foo` with `x` that is not valid UTF-8.
+fn malformed_foo() -> Vec<u8> {
+    [
+        bcs::to_bytes(&[0xFFu8, 0xFE].as_slice()).unwrap(),
+        bcs::to_bytes(&7u64).unwrap(),
+    ]
+    .concat()
+}
+
+/// A public struct argument runs like on v1.
+#[test]
+fn public_struct_argument_accepted_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "pubs", "takes_foo", vec![valid_foo()]);
+    assert_succeeds_like_v1(&fx, &alice, txn);
+}
+
+/// A malformed `String` field of a public struct is refused.
+#[test]
+fn malformed_string_in_public_struct_rejected() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "pubs", "takes_foo", vec![malformed_foo()]);
+    assert_rejected_by_both(&fx, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
+}
+
+/// A malformed `String` field of a public struct inside a vector is refused,
+/// past a valid element.
+#[test]
+fn malformed_string_in_public_struct_in_vector_rejected() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "pubs", "takes_foos", vec![[
+        vec![0x02],
+        valid_foo(),
+        malformed_foo(),
+    ]
+    .concat()]);
+    assert_rejected_by_both(&fx, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
+}
+
+/// An `Option` of a public struct runs like on v1, as `Some` and as `None`.
+#[test]
+fn option_of_public_struct_accepted_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let some = call_txn(&alice, address, "pubs", "takes_opt_foo", vec![[
+        vec![0x01],
+        valid_foo(),
+    ]
+    .concat()]);
+    assert_succeeds_like_v1(&fx, &alice, some);
+    let none = call_txn(&alice, address, "pubs", "takes_opt_foo", vec![vec![0x00]]);
+    assert_succeeds_like_v1(&fx, &alice, none);
+}
+
+/// A public enum argument runs like on v1, for each variant.
+#[test]
+fn public_enum_argument_accepted_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let circle = call_txn(&alice, address, "pubs", "takes_shape", vec![[
+        vec![0x00],
+        bcs::to_bytes(&1u64).unwrap(),
+    ]
+    .concat()]);
+    assert_succeeds_like_v1(&fx, &alice, circle);
+    let label = call_txn(&alice, address, "pubs", "takes_shape", vec![[
+        vec![0x01],
+        bcs::to_bytes("hi").unwrap(),
+    ]
+    .concat()]);
+    assert_succeeds_like_v1(&fx, &alice, label);
+}
+
+/// A malformed `String` field of a public enum variant is refused.
+#[test]
+fn malformed_string_in_public_enum_rejected() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "pubs", "takes_shape", vec![[
+        vec![0x01],
+        bcs::to_bytes(&[0xFFu8, 0xFE].as_slice()).unwrap(),
+    ]
+    .concat()]);
+    assert_rejected_by_both(&fx, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
+}
+
+/// A public enum value with an out-of-range variant tag is refused like on
+/// v1.
+#[test]
+fn public_enum_out_of_range_tag_rejected_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "pubs", "takes_shape", vec![[
+        vec![0x02],
+        bcs::to_bytes(&1u64).unwrap(),
+    ]
+    .concat()]);
+    assert_kept_with_code_like_v1(&fx, &alice, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
+}
+
+/// An enum missing a variant's pack function is refused as a type, even for
+/// a value of a variant that has one; v1 refuses only the missing variant.
+#[test]
+fn enum_missing_variant_pack_function_refused() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let packable = call_txn(&alice, address, "pubs", "takes_partial", vec![[
+        vec![0x00],
+        bcs::to_bytes(&5u64).unwrap(),
+    ]
+    .concat()]);
+    assert_v1_runs_but_v2_rejects(&fx, packable, StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE);
+    let unpackable = call_txn(&alice, address, "pubs", "takes_partial", vec![[
+        vec![0x01],
+        bcs::to_bytes(&5u64).unwrap(),
+    ]
+    .concat()]);
+    assert_kept_with_code_like_v1(
+        &fx,
+        &alice,
+        unpackable,
+        StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE,
+    );
+}
+
+/// Structs without a pack function, with `key`, without `copy`, or with a
+/// field of such a type are refused like on v1.
+#[test]
+fn ineligible_structs_rejected_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    for function in [
+        "takes_private",
+        "takes_keyed",
+        "takes_nocopy",
+        "takes_box_private",
+    ] {
+        let txn = call_txn(&alice, address, "pubs", function, vec![bcs::to_bytes(
+            &5u64,
+        )
+        .unwrap()]);
+        assert_kept_with_code_like_v1(
+            &fx,
+            &alice,
+            txn,
+            StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE,
+        );
+    }
+}
+
+/// A generic public struct instantiated with an allowed type runs like on v1.
+#[test]
+fn generic_public_struct_argument_accepted_like_v1() {
+    let (mut fx, alice, _bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "pubs", "takes_box_string", vec![
+        bcs::to_bytes("hi").unwrap(),
+    ]);
+    assert_succeeds_like_v1(&fx, &alice, txn);
+}
+
+/// An `Object<T>` nested in a public struct inside a vector is checked: the
+/// second box names an address with no object.
+#[test]
+fn object_in_public_struct_in_vector_rejected() {
+    let (mut fx, alice, bob) = setup();
+    let address = publish_module(&mut fx, PUBLIC_STRUCT_ENTRY_FUNCTIONS);
+    let txn = call_txn(&alice, address, "pubs", "takes_boxed_objects", vec![[
+        vec![0x02],
+        bcs::to_bytes(&APT_METADATA_OBJECT).unwrap(),
+        bcs::to_bytes(bob.address()).unwrap(),
+    ]
+    .concat()]);
+    assert_rejected_by_both(&fx, txn, StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT);
 }
 
 /// Transactions violating the pre-execution gas bounds expressible by the
@@ -465,6 +1628,14 @@ fn gas_checks_discard_like_v1() {
             transfer(u64::MAX, 1_000_000),
             StatusCode::GAS_UNIT_PRICE_ABOVE_MAX_BOUND,
         ),
+        (
+            encrypted_txn(
+                &alice,
+                encrypted_min_gas_unit_price() - 1,
+                failed_decryption,
+            ),
+            StatusCode::ENCRYPTED_TXN_GAS_UNIT_PRICE_BELOW_MIN_BOUND,
+        ),
     ];
     // The fixture's current minimum price is zero, for which no valid `u64`
     // gas price can be below the bound. Keep the check active when the
@@ -489,6 +1660,316 @@ fn gas_checks_discard_like_v1() {
             "v2 discard differs from v1 for {expected:?}"
         );
     }
+}
+
+/// An encrypted transaction. It is signed while still encrypted, the way a
+/// client submits it, then moved to the state `after_decryption` returns.
+fn encrypted_txn(
+    sender: &AccountData,
+    gas_unit_price: u64,
+    after_decryption: impl FnOnce(EncryptedInner) -> EncryptedPayload,
+) -> SignedTransaction {
+    use aptos_crypto::HashValue;
+    use aptos_types::{
+        secret_sharing::Ciphertext,
+        transaction::{TransactionExtraConfig, TransactionPayload},
+    };
+
+    let original = EncryptedInner {
+        ciphertext: Ciphertext::random(),
+        extra_config: TransactionExtraConfig::V1 {
+            multisig_address: None,
+            replay_protection_nonce: None,
+        },
+        payload_hash: HashValue::random(),
+        encryption_epoch: 1,
+        claimed_entry_fun: None,
+    };
+    let mut txn = sender
+        .account()
+        .transaction()
+        .payload(TransactionPayload::EncryptedPayload(
+            EncryptedPayload::Encrypted(original.clone()),
+        ))
+        .sequence_number(10)
+        .gas_unit_price(gas_unit_price)
+        .max_gas_amount(1_000_000)
+        .sign();
+    *txn.payload_mut() = TransactionPayload::EncryptedPayload(after_decryption(original));
+    txn
+}
+
+/// A payload whose decryption failed.
+fn failed_decryption(original: EncryptedInner) -> EncryptedPayload {
+    EncryptedPayload::FailedDecryption {
+        original,
+        eval_proof: Some(EvalProof::random()),
+        reason: DecryptionFailureReason::CryptoFailure,
+    }
+}
+
+/// The minimum gas unit price an encrypted transaction must pay.
+fn encrypted_min_gas_unit_price() -> u64 {
+    TransactionGasParameters::initial()
+        .encrypted_txn_min_price_per_gas_unit
+        .into()
+}
+
+/// A transaction that could not be decrypted still commits, and its sequence
+/// number is bumped so it cannot be replayed.
+//
+// Only the status is compared: nothing runs, so no fee is charged yet.
+#[test]
+fn undecrypted_payload_kept_like_v1() {
+    use aptos_types::{account_config::AccountResource, state_store::state_key::StateKey};
+
+    let (fx, alice, _bob) = setup();
+    let txn = encrypted_txn(&alice, encrypted_min_gas_unit_price(), failed_decryption);
+
+    let v1_output = fx.execute_transaction(txn.clone());
+    assert_eq!(
+        v1_output.status(),
+        &TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(Some(
+            StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT
+        ))),
+        "v1 did not keep the undecrypted transaction"
+    );
+
+    let v2_output = execute_v2(fx.get_state_view(), &txn);
+    assert_eq!(v2_output.status(), v1_output.status());
+
+    // The sequence number lives in the sender's account resource.
+    let account_key =
+        StateKey::resource_typed::<AccountResource>(alice.address()).expect("the key builds");
+    for (vm, output) in [("v1", &v1_output), ("v2", &v2_output)] {
+        assert!(
+            output
+                .write_set()
+                .write_op_iter()
+                .any(|(key, _)| key == &account_key),
+            "{vm} did not bump the sequence number"
+        );
+    }
+}
+
+/// A decrypted payload runs as the plain transaction it carries.
+#[test]
+fn decrypted_payload_matches_v1() {
+    use aptos_types::transaction::{TransactionExecutable, TransactionPayload};
+
+    let (fx, alice, bob) = setup();
+    let TransactionPayload::EntryFunction(transfer) =
+        aptos_cached_packages::aptos_stdlib::aptos_account_transfer(*bob.address(), 1_000)
+    else {
+        unreachable!("the SDK builds a transfer as an entry function")
+    };
+    let txn = encrypted_txn(&alice, encrypted_min_gas_unit_price(), |original| {
+        EncryptedPayload::Decrypted {
+            original,
+            eval_proof: EvalProof::random(),
+            decrypted: DecryptedPlaintext::new(
+                TransactionExecutable::EntryFunction(transfer),
+                [0u8; 16],
+            ),
+        }
+    });
+
+    let v1_output = fx.execute_transaction(txn.clone());
+    assert_eq!(
+        v1_output.status(),
+        &TransactionStatus::Keep(ExecutionStatus::Success),
+        "v1 rejected the decrypted transfer: {:?}",
+        v1_output.status()
+    );
+    let v2_output = execute_v2(fx.get_state_view(), &txn);
+    assert_eq!(v2_output.status(), v1_output.status());
+    compare_outputs(&v1_output, &v2_output, *alice.address());
+}
+
+/// Only a multisig transaction may leave out the executable.
+#[test]
+fn empty_payload_discarded_like_v1() {
+    use aptos_types::transaction::{
+        TransactionExecutable, TransactionExtraConfig, TransactionPayload, TransactionPayloadInner,
+    };
+
+    let (fx, alice, _bob) = setup();
+    let txn = alice
+        .account()
+        .transaction()
+        .payload(TransactionPayload::Payload(TransactionPayloadInner::V1 {
+            executable: TransactionExecutable::Empty,
+            extra_config: TransactionExtraConfig::V1 {
+                multisig_address: None,
+                replay_protection_nonce: None,
+            },
+        }))
+        .sequence_number(10)
+        .gas_unit_price(100)
+        .max_gas_amount(1_000_000)
+        .sign();
+
+    let v1_status = fx.execute_transaction(txn.clone()).status().clone();
+    assert_eq!(
+        v1_status,
+        TransactionStatus::Discard(StatusCode::EMPTY_PAYLOAD_PROVIDED)
+    );
+    assert_eq!(execute_v2(fx.get_state_view(), &txn).status(), &v1_status);
+}
+
+/// `status` with any abort info stripped.
+//
+// TODO(correctness): compare the abort info too, once the executor resolves it.
+fn without_abort_info(status: &TransactionStatus) -> TransactionStatus {
+    match status {
+        TransactionStatus::Keep(ExecutionStatus::MoveAbort { location, code, .. }) => {
+            TransactionStatus::Keep(ExecutionStatus::MoveAbort {
+                location: location.clone(),
+                code: *code,
+                info: None,
+            })
+        },
+        TransactionStatus::Keep(
+            ExecutionStatus::Success
+            | ExecutionStatus::OutOfGas
+            | ExecutionStatus::ExecutionFailure { .. }
+            | ExecutionStatus::MiscellaneousError(_),
+        )
+        | TransactionStatus::Discard(_)
+        | TransactionStatus::Retry => status.clone(),
+    }
+}
+
+/// Asserts both VMs agree on `txn`, modulo gas, and returns V1's output.
+fn assert_output_matches_v1(
+    fx: &FakeExecutor,
+    txn: &SignedTransaction,
+    fee_payer: move_core_types::account_address::AccountAddress,
+) -> TransactionOutput {
+    let v1_output = fx.execute_transaction(txn.clone());
+    let v2_output = execute_v2(fx.get_state_view(), txn);
+    assert_eq!(
+        without_abort_info(v2_output.status()),
+        without_abort_info(v1_output.status()),
+        "v2 status differs from v1"
+    );
+    compare_outputs(&v1_output, &v2_output, fee_payer);
+    v1_output
+}
+
+/// Entry functions that call the randomness API, of every visibility. All but
+/// `unannotated` get the `#[randomness]` annotation when published.
+const RANDOMNESS_ENTRY_FUNCTIONS: &str = r#"
+module 0xcafe::randomness_users
+use 0x1::randomness
+
+entry fun annotated()
+    call randomness::u64_integer
+    pop
+    ret
+
+entry friend fun friend_annotated()
+    call randomness::u64_integer
+    pop
+    ret
+
+entry fun unannotated()
+    call randomness::u64_integer
+    pop
+    ret
+
+entry public fun public_annotated()
+    call randomness::u64_integer
+    pop
+    ret
+"#;
+
+/// Publishes `RANDOMNESS_ENTRY_FUNCTIONS` with the annotation attached to the
+/// functions whose name says so, and returns the module's address.
+fn publish_randomness_module(
+    fx: &mut FakeExecutor,
+) -> move_core_types::account_address::AccountAddress {
+    use aptos_types::vm::module_metadata::{
+        KnownAttribute, RuntimeModuleMetadataV1, APTOS_METADATA_KEY_V1,
+    };
+    use move_core_types::metadata::Metadata;
+
+    let (mut module, _) =
+        aptos_language_e2e_tests::compile::compile_module(RANDOMNESS_ENTRY_FUNCTIONS);
+    let metadata = RuntimeModuleMetadataV1 {
+        fun_attributes: ["annotated", "friend_annotated", "public_annotated"]
+            .into_iter()
+            .map(|name| (name.to_string(), vec![KnownAttribute::randomness(None)]))
+            .collect(),
+        ..Default::default()
+    };
+    module.metadata.push(Metadata {
+        key: APTOS_METADATA_KEY_V1.to_vec(),
+        value: bcs::to_bytes(&metadata).expect("the metadata serializes"),
+    });
+
+    let mut blob = vec![];
+    module
+        .serialize(&mut blob)
+        .expect("the annotated module serializes");
+    fx.add_module(&module.self_id(), blob);
+    *module.self_id().address()
+}
+
+/// Runs a block prologue carrying a randomness seed, which genesis leaves
+/// unset, so the randomness API has something to derive from.
+fn seed_block_randomness(fx: &mut FakeExecutor) {
+    let block_metadata_ext = block_metadata_with_randomness_seed(fx);
+    let outputs = fx
+        .execute_transaction_block(vec![Transaction::BlockMetadataExt(block_metadata_ext)])
+        .expect("v1 executes the block");
+    fx.apply_write_set(outputs[0].write_set());
+}
+
+/// Only a private or friend entry function carrying the `#[randomness]`
+/// annotation may call the randomness API. Each case is compared against V1
+/// rather than against fixed abort codes.
+#[test]
+fn randomness_api_matches_v1() {
+    const RANDOMNESS_EVENT: &str = "0x1::randomness::RandomnessGeneratedEvent";
+
+    let (mut fx, alice, _bob) = setup();
+    seed_block_randomness(&mut fx);
+    let module = publish_randomness_module(&mut fx);
+    let call = |function: &str| call_txn(&alice, module, "randomness_users", function, vec![]);
+
+    for function in ["annotated", "friend_annotated"] {
+        let output = assert_output_matches_v1(&fx, &call(function), *alice.address());
+        assert_eq!(
+            output.status(),
+            &TransactionStatus::Keep(ExecutionStatus::Success),
+            "{function} could not use randomness"
+        );
+        assert!(
+            output
+                .events()
+                .iter()
+                .any(|event| event.type_tag().to_canonical_string() == RANDOMNESS_EVENT),
+            "{function} used randomness without the framework recording it"
+        );
+    }
+
+    let unannotated = assert_output_matches_v1(&fx, &call("unannotated"), *alice.address());
+    assert!(
+        matches!(
+            unannotated.status(),
+            TransactionStatus::Keep(ExecutionStatus::MoveAbort { .. })
+        ),
+        "an unannotated function used randomness: {:?}",
+        unannotated.status()
+    );
+    let public_annotated =
+        assert_output_matches_v1(&fx, &call("public_annotated"), *alice.address());
+    assert_eq!(
+        public_annotated.status(),
+        unannotated.status(),
+        "a public entry function must not be allowed to use randomness"
+    );
 }
 
 /// A block-metadata transaction produces byte-identical outputs on both VMs:
@@ -540,35 +2021,8 @@ fn block_metadata_matches_v1() {
 /// encrypted transactions.
 #[test]
 fn block_metadata_ext_v3_matches_v1() {
-    use aptos_types::{
-        block_metadata_ext::BlockMetadataExt,
-        on_chain_config::{OnChainConfig, ValidatorSet},
-        randomness::{RandMetadata, Randomness},
-    };
-
     let (mut fx, _alice, _bob) = setup();
-    let validator_set = ValidatorSet::fetch_config(fx.get_state_view())
-        .expect("the validator set is readable")
-        .expect("genesis has a validator set");
-    let proposer = *validator_set
-        .payload()
-        .next()
-        .expect("genesis has a validator")
-        .account_address();
-    let block_metadata_ext = BlockMetadataExt::new_v3(
-        aptos_crypto::HashValue::sha3_256_of(b"mono-move ext block"),
-        1,
-        1,
-        proposer,
-        vec![],
-        vec![],
-        fx.get_block_time() + 100,
-        Some(Randomness::new(
-            RandMetadata { epoch: 1, round: 1 },
-            vec![7u8; 32],
-        )),
-        None,
-    );
+    let block_metadata_ext = block_metadata_with_randomness_seed(&mut fx);
 
     let v1_outputs = fx
         .execute_transaction_block(vec![Transaction::BlockMetadataExt(
@@ -590,6 +2044,41 @@ fn block_metadata_ext_v3_matches_v1() {
         )
     });
     compare_system_outputs(v1_output, &v2_output);
+}
+
+/// Extended block metadata carrying a randomness seed and no decryption
+/// payload, proposed by a genesis validator.
+fn block_metadata_with_randomness_seed(
+    fx: &mut FakeExecutor,
+) -> aptos_types::block_metadata_ext::BlockMetadataExt {
+    use aptos_types::{
+        block_metadata_ext::BlockMetadataExt,
+        on_chain_config::{OnChainConfig, ValidatorSet},
+        randomness::{RandMetadata, Randomness},
+    };
+
+    let validator_set = ValidatorSet::fetch_config(fx.get_state_view())
+        .expect("the validator set is readable")
+        .expect("genesis has a validator set");
+    let proposer = *validator_set
+        .payload()
+        .next()
+        .expect("genesis has a validator")
+        .account_address();
+    BlockMetadataExt::new_v3(
+        aptos_crypto::HashValue::sha3_256_of(b"mono-move ext block"),
+        1,
+        1,
+        proposer,
+        vec![],
+        vec![],
+        fx.get_block_time() + 100,
+        Some(Randomness::new(
+            RandMetadata { epoch: 1, round: 1 },
+            vec![7u8; 32],
+        )),
+        None,
+    )
 }
 
 /// Both system-transaction outputs must be fee-free and match byte-for-byte,

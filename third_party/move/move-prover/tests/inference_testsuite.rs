@@ -5,9 +5,9 @@
 //!
 //! For each `.move` file under `tests/inference/`, this driver:
 //! 1. Compiles a Move model from the source.
-//! 2. Runs the spec inference pipeline in Unified output mode, producing `.exp.move`
-//!    files that contain the original source with inferred specs inlined.
-//! 3. Runs the Move Prover on the enriched file (original source + inline specs).
+//! 2. Runs the spec inference pipeline in Unified output mode, except for tests
+//!    carrying `// inference-output: file`, and records the generated source.
+//! 3. Runs the Move Prover on the enriched source or source-plus-companion pair.
 //! 4. Compares the `.exp.move` file against the baseline.
 
 use codespan_reporting::term::termcolor::Buffer;
@@ -36,15 +36,24 @@ static NOT_CONFIGURED_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn test_runner(path: &Path) -> anyhow::Result<()> {
     let mut baseline_out = String::new();
+    let file_output = extract_test_directives(path, "// inference-output:")?
+        .iter()
+        .any(|value| value.trim() == "file");
 
-    // ── Step 1: Run spec inference in Unified mode ───────────────────
+    // ── Step 1: Run spec inference and capture generated source ──────
 
     // Write the enriched file to a temp directory so no stale files are left
     // next to the source. The temp dir is kept alive until the end of the test.
     let enriched_dir = tempfile::TempDir::new()?;
-    let enriched_path = enriched_dir
-        .path()
-        .join(path.with_extension("enriched.move").file_name().unwrap());
+    let enriched_path = if file_output {
+        enriched_dir
+            .path()
+            .join(path.with_extension("spec.move").file_name().unwrap())
+    } else {
+        enriched_dir
+            .path()
+            .join(path.with_extension("enriched.move").file_name().unwrap())
+    };
 
     // If a companion .spec.move exists next to the source, include it in both
     // the inference and verification steps.  This exercises Bug 8b: output_unified
@@ -61,12 +70,19 @@ fn test_runner(path: &Path) -> anyhow::Result<()> {
     let check_evidence_isolation = loop_invariant_evidence.is_some();
     inf_options.inference = InferenceOptions {
         inference: true,
-        inference_output: InferenceOutput::Unified,
+        inference_output: if file_output {
+            InferenceOutput::File
+        } else {
+            InferenceOutput::Unified
+        },
         inference_output_dir: Some(enriched_dir.path().to_string_lossy().to_string()),
         inference_unified_suffix: "enriched.move".to_string(),
         loop_invariant_evidence,
     };
     inf_options.setup_logging_for_test();
+    let reject_incomplete =
+        !extract_test_directives(path, "// reject-incomplete-inference:")?.is_empty();
+    inf_options.prover.uninvariant_loop_is_error = reject_incomplete;
     inf_options.prover.stable_test_output = true;
     inf_options.backend.stable_test_output = true;
 
@@ -88,6 +104,12 @@ fn test_runner(path: &Path) -> anyhow::Result<()> {
     // Collect inference-phase diagnostics (shown at the end in a comment).
     let mut diags = String::new();
     let inference_failed = result.is_err();
+    if reject_incomplete {
+        anyhow::ensure!(
+            inference_failed,
+            "expected incomplete inference to be rejected"
+        );
+    }
     match result {
         Ok(()) => {},
         Err(err) => {
@@ -114,17 +136,28 @@ fn test_runner(path: &Path) -> anyhow::Result<()> {
     // source to remain byte-for-byte identical.
     if check_evidence_isolation {
         let control_dir = tempfile::TempDir::new()?;
-        let control_path = control_dir
-            .path()
-            .join(path.with_extension("enriched.move").file_name().unwrap());
+        let control_path = if file_output {
+            control_dir
+                .path()
+                .join(path.with_extension("spec.move").file_name().unwrap())
+        } else {
+            control_dir
+                .path()
+                .join(path.with_extension("enriched.move").file_name().unwrap())
+        };
         let mut control_options = make_options(path, &extra_sources)?;
         control_options.inference = InferenceOptions {
             inference: true,
-            inference_output: InferenceOutput::Unified,
+            inference_output: if file_output {
+                InferenceOutput::File
+            } else {
+                InferenceOutput::Unified
+            },
             inference_output_dir: Some(control_dir.path().to_string_lossy().to_string()),
             inference_unified_suffix: "enriched.move".to_string(),
             loop_invariant_evidence: None,
         };
+        control_options.prover.uninvariant_loop_is_error = reject_incomplete;
         control_options.setup_logging_for_test();
         control_options.prover.stable_test_output = true;
         control_options.backend.stable_test_output = true;
@@ -157,7 +190,14 @@ fn test_runner(path: &Path) -> anyhow::Result<()> {
             let no_tools =
                 read_env_var("BOOGIE_EXE").is_empty() || read_env_var("Z3_EXE").is_empty();
 
-            let mut verify_options = make_options(&enriched_path, &extra_sources)?;
+            let mut generated_extra_sources = extra_sources.clone();
+            let verify_source = if file_output {
+                generated_extra_sources.push(enriched_path.clone());
+                path
+            } else {
+                enriched_path.as_path()
+            };
+            let mut verify_options = make_options(verify_source, &generated_extra_sources)?;
             verify_options.setup_logging_for_test();
             verify_options.prover.stable_test_output = true;
             verify_options.backend.stable_test_output = true;
@@ -196,6 +236,42 @@ fn test_runner(path: &Path) -> anyhow::Result<()> {
         })();
 
         verify_result?;
+
+        // A verified inferred contract can still be vacuous. Fixtures may
+        // require it to reject a particular implementation-only mutation.
+        for mutation in extract_test_directives(path, "// inference-reject-mutation:")? {
+            anyhow::ensure!(!file_output, "mutation checks require unified output");
+            let (from, to) = mutation
+                .split_once(" => ")
+                .ok_or_else(|| anyhow::anyhow!("mutation must be FROM => TO"))?;
+            let source = std::fs::read_to_string(&enriched_path)?
+                .lines()
+                .filter(|line| {
+                    !line
+                        .trim_start()
+                        .starts_with("// inference-reject-mutation:")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::ensure!(
+                source.matches(from).count() == 1,
+                "mutation anchor must be unique"
+            );
+            let mutant = enriched_dir.path().join("mutant.move");
+            std::fs::write(&mutant, source.replacen(from, to, 1))?;
+            let mut options = make_options(&mutant, &extra_sources)?;
+            options.prover.stable_test_output = true;
+            options.backend.stable_test_output = true;
+            let mut writer = Buffer::no_color();
+            let result = run_move_prover_v2(&mut writer, options, vec![]);
+            let diagnostics = String::from_utf8_lossy(&writer.into_inner()).into_owned();
+            anyhow::ensure!(
+                result.is_err() && diagnostics.contains("post-condition does not hold"),
+                "inferred contract did not reject the mutation with a postcondition failure: {}",
+                diagnostics
+            );
+            diags += "Mutation: Rejected by postcondition.\n";
+        }
     }
 
     // ── Step 3: Append diagnostics as a block comment ───────────────

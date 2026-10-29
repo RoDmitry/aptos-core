@@ -11,6 +11,7 @@
 use crate::{
     ast::{Exp, ExpData, Operation},
     exp_generator::ExpGenerator,
+    intrinsics::{IntrinsicDecl, IterKeyField},
     model::{
         FunId, FunctionEnv, GlobalEnv, ModuleEnv, QualifiedId, QualifiedInstId, SpecFunId, StructId,
     },
@@ -57,7 +58,29 @@ pub const VECTOR_FUNCS_WITH_BYTECODE_INSTRS: &[&str] = &[
     "swap",
 ];
 
+/// Move-level `std::vector` functions whose bodies are replaced by procedures
+/// from the Boogie prelude via `pragma intrinsic`.
+pub const VECTOR_MOVE_INTRINSICS: &[&str] = &[
+    "reverse",
+    "reverse_slice",
+    "append",
+    "is_empty",
+    "reverse_append",
+    "trim",
+    "trim_reverse",
+    "contains",
+    "index_of",
+    "insert",
+    "remove",
+    "remove_value",
+    "swap_remove",
+    "rotate",
+    "rotate_slice",
+];
+
 pub const CMP_MODULE: &str = "cmp";
+
+pub const EVENT_MODULE: &str = "event";
 
 pub const STRING_MODULE: &str = "string";
 pub const STRING_UTILS_MODULE: &str = "string_utils";
@@ -211,24 +234,69 @@ pub fn is_memory_free_native(fun_env: &FunctionEnv) -> bool {
 /// calls only for this closed set; all other native companions must remain
 /// behavioral and uninterpreted.
 pub fn is_boogie_prelude_spec_native(fun_env: &FunctionEnv) -> bool {
-    let module_functions: &[(&str, &[&str])] = &[
-        (VECTOR_MODULE, &[
-            "empty",
-            "push_back",
-            "length",
-            "borrow",
-            "borrow_mut",
-            "swap",
-        ]),
-        ("bcs", &["to_bytes"]),
-        ("from_bcs", &["from_bytes"]),
-        ("hash", &["sha2_256", "sha3_256"]),
-        (SIGNER_MODULE, &["borrow_address"]),
-    ];
+    is_std_function_in(fun_env, PRELUDE_SPEC_NATIVES)
+}
+
+/// The natives [`is_boogie_prelude_spec_native`] names. `cmp::compare`'s
+/// `$compare` is defined by the Aptos natives template, which every package
+/// with `std::cmp` uses.
+pub const PRELUDE_SPEC_NATIVES: &[(&str, &[&str])] = &[
+    (VECTOR_MODULE, &[
+        "empty",
+        "push_back",
+        "length",
+        "borrow",
+        "borrow_mut",
+        "swap",
+    ]),
+    ("bcs", &["to_bytes"]),
+    ("from_bcs", &["from_bytes"]),
+    ("hash", &["sha2_256", "sha3_256"]),
+    (SIGNER_MODULE, &["borrow_address"]),
+    (CMP_MODULE, &["compare"]),
+];
+
+/// Whether the prover's model of this native never aborts: its Boogie
+/// procedure has no abort.
+pub fn is_non_aborting_prelude_native(fun_env: &FunctionEnv) -> bool {
+    fun_env.is_native_or_intrinsic() && is_std_function_in(fun_env, NON_ABORTING_PRELUDE_NATIVES)
+}
+
+/// The natives [`is_non_aborting_prelude_native`] names.
+pub const NON_ABORTING_PRELUDE_NATIVES: &[(&str, &[&str])] = &[
+    ("bcs", &["to_bytes"]),
+    ("hash", &["sha2_256", "sha3_256"]),
+    (SIGNER_MODULE, &["borrow_address"]),
+    (CMP_MODULE, &["compare"]),
+];
+
+fn is_std_function_in(fun_env: &FunctionEnv, module_functions: &[(&str, &[&str])]) -> bool {
     let fun_name = fun_env.get_name_str();
     module_functions.iter().any(|(module, functions)| {
         fun_env.module_env.is_module_in_std(module) && functions.contains(&fun_name.as_str())
     })
+}
+
+/// Whether the Boogie prelude implements this `pragma intrinsic` function.
+///
+/// `pragma intrinsic` says the prover implements the function itself, so the
+/// backend emits no body for it and a call site translates to a procedure the
+/// prelude is expected to declare. The built-in prelude mocks out `vector` and
+/// `event`, while Aptos's custom-native prelude implements `aggregator` and
+/// `aggregator_v2`.
+/// A native intrinsic is prelude-backed by construction. A function carrying
+/// the pragma outside those modules has no implementation anywhere, and a call
+/// to it would name a procedure that is never declared.
+///
+/// The modules mirror the `$1_<module>_<name>` procedure templates in
+/// `src/prelude/native.bpl`, `src/prelude/prelude.bpl`, and the configured
+/// Aptos `aptos-natives.bpl` template.
+pub fn is_boogie_prelude_intrinsic(fun_env: &FunctionEnv) -> bool {
+    const PRELUDE_INTRINSIC_MODULES: &[&str] =
+        &[VECTOR_MODULE, EVENT_MODULE, "aggregator", "aggregator_v2"];
+    PRELUDE_INTRINSIC_MODULES
+        .iter()
+        .any(|module| fun_env.module_env.is_module_in_std(module))
 }
 
 /// True when `fun_name` is the bare name of a `std::vector` function whose
@@ -237,16 +305,13 @@ pub fn is_boogie_prelude_spec_native(fun_env: &FunctionEnv) -> bool {
 /// `requires_of`, `result_of`, `ensures_of`).
 ///
 /// This covers the bytecode-instruction natives in
-/// [`VECTOR_FUNCS_WITH_BYTECODE_INSTRS`] plus the loop-implemented (but
-/// prover-intrinsic) functions with an exact WP arm in
-/// [`vector_intrinsic_wp`]: `singleton`, `contains`, `index_of`,
-/// `swap_remove`, `append`, `remove`, and `insert`.
+/// [`VECTOR_FUNCS_WITH_BYTECODE_INSTRS`], every Move-level prover intrinsic in
+/// [`VECTOR_MOVE_INTRINSICS`], the prelude-backed `move_range` native, and
+/// `singleton`, whose existing exact source contract has the same direct WP.
 pub(crate) fn is_special_vector_bp_fun_name(fun_name: &str) -> bool {
     VECTOR_FUNCS_WITH_BYTECODE_INSTRS.contains(&fun_name)
-        || matches!(
-            fun_name,
-            "singleton" | "contains" | "index_of" | "swap_remove" | "append" | "remove" | "insert"
-        )
+        || VECTOR_MOVE_INTRINSICS.contains(&fun_name)
+        || matches!(fun_name, "move_range" | "singleton")
 }
 
 /// If `fun_exp` is a closure with no captured arguments targeting a special
@@ -416,6 +481,84 @@ pub fn vector_intrinsic_wp<'env, G: ExpGenerator<'env>>(
                 )],
             }
         },
+        // is_empty(v): the intrinsic Boogie procedure returns exactly
+        // `len(v) == 0` and has no aborting path. Keep that meaning internal
+        // to WP rather than manufacturing a source-level spec block for the
+        // intrinsic itself.
+        "is_empty" => {
+            let v = arg(0)?;
+            IntrinsicWp {
+                aborts: g.mk_bool_const(false),
+                outputs: vec![g.mk_eq(g.mk_len(v), zero())],
+            }
+        },
+        "reverse" => {
+            let v = arg(0)?;
+            IntrinsicWp {
+                aborts: g.mk_bool_const(false),
+                outputs: vec![g.mk_reverse_vec(v, &vec_ty)],
+            }
+        },
+        "reverse_slice" => {
+            let v = arg(0)?;
+            let left = arg(1)?;
+            let right = arg(2)?;
+            let trivial = g.mk_bool_call(Operation::Le, vec![
+                right.clone(),
+                g.mk_num_add(left.clone(), one()),
+            ]);
+            let prefix = g.mk_slice(v.clone(), zero(), left.clone(), &vec_ty);
+            let middle = g.mk_reverse_vec(
+                g.mk_slice(v.clone(), left.clone(), right.clone(), &vec_ty),
+                &vec_ty,
+            );
+            let suffix = g.mk_slice(v.clone(), right.clone(), g.mk_len(v.clone()), &vec_ty);
+            let reversed =
+                g.mk_concat_vec(prefix, g.mk_concat_vec(middle, suffix, &vec_ty), &vec_ty);
+            let output = g.mk_ite(
+                trivial.as_ref().clone(),
+                v.as_ref().clone(),
+                reversed.as_ref().clone(),
+            );
+            IntrinsicWp {
+                // The implementation reaches no indexed swap for a range of
+                // zero or one element, and therefore performs no bounds check.
+                aborts: g.mk_or(
+                    g.mk_bool_call(Operation::Gt, vec![left.clone(), right.clone()]),
+                    g.mk_and(
+                        g.mk_bool_call(Operation::Gt, vec![
+                            right.clone(),
+                            g.mk_num_add(left, one()),
+                        ]),
+                        g.mk_bool_call(Operation::Gt, vec![right, g.mk_len(v)]),
+                    ),
+                ),
+                outputs: vec![output],
+            }
+        },
+        "reverse_append" => {
+            let v = arg(0)?;
+            let other = arg(1)?;
+            IntrinsicWp {
+                aborts: g.mk_bool_const(false),
+                outputs: vec![g.mk_concat_vec(v, g.mk_reverse_vec(other, &vec_ty), &vec_ty)],
+            }
+        },
+        "trim" | "trim_reverse" => {
+            let v = arg(0)?;
+            let new_len = arg(1)?;
+            let removed = g.mk_slice(v.clone(), new_len.clone(), g.mk_len(v.clone()), &vec_ty);
+            let result = if fun_name == "trim_reverse" {
+                g.mk_reverse_vec(removed, &vec_ty)
+            } else {
+                removed
+            };
+            let retained = g.mk_slice(v.clone(), zero(), new_len.clone(), &vec_ty);
+            IntrinsicWp {
+                aborts: g.mk_bool_call(Operation::Gt, vec![new_len, g.mk_len(v)]),
+                outputs: vec![result, retained],
+            }
+        },
         "contains" => {
             let v = arg(0)?;
             let e = arg(1)?;
@@ -430,7 +573,7 @@ pub fn vector_intrinsic_wp<'env, G: ExpGenerator<'env>>(
             }
         },
         // index_of returns `(true, i)` for the smallest `i` with `v[i] == e`,
-        // or `(false, 0)` if `e` is not contained (see `$1_vector_index_of`
+        // or `(false, 0)` if `e` is not contained (see `$1.vector.index_of`
         // in the Boogie prelude, which the intrinsic is verified against).
         "index_of" => {
             let v = arg(0)?;
@@ -475,6 +618,41 @@ pub fn vector_intrinsic_wp<'env, G: ExpGenerator<'env>>(
                 outputs: vec![g.mk_concat_vec(v, other, &vec_ty)],
             }
         },
+        "remove_value" => {
+            let v = arg(0)?;
+            let e = arg(1)?;
+            let contains = g.mk_contains_vec(v.clone(), e.clone(), &elem_ty);
+            let index = g.mk_call_with_inst(
+                &Type::Primitive(crate::ty::PrimitiveType::Num),
+                vec![elem_ty.clone()],
+                Operation::IndexOfVec,
+                vec![v.clone(), e],
+            );
+            let removed_element = g.mk_index(v.clone(), index.clone(), &elem_ty);
+            let result_if_found = g.mk_single_vec(removed_element, &elem_ty);
+            let result = g.mk_ite(
+                contains.as_ref().clone(),
+                result_if_found.as_ref().clone(),
+                g.mk_empty_vec(&elem_ty).as_ref().clone(),
+            );
+            let prefix = g.mk_slice(v.clone(), zero(), index.clone(), &vec_ty);
+            let suffix = g.mk_slice(
+                v.clone(),
+                g.mk_num_add(index, one()),
+                g.mk_len(v.clone()),
+                &vec_ty,
+            );
+            let removed = g.mk_concat_vec(prefix, suffix, &vec_ty);
+            let post = g.mk_ite(
+                contains.as_ref().clone(),
+                removed.as_ref().clone(),
+                v.as_ref().clone(),
+            );
+            IntrinsicWp {
+                aborts: g.mk_bool_const(false),
+                outputs: vec![result, post],
+            }
+        },
         // remove(v, i) returns v[i] and shifts the suffix down:
         // post-state `concat(v[0..i], v[i+1..len(v)])`.
         "remove" => {
@@ -509,17 +687,412 @@ pub fn vector_intrinsic_wp<'env, G: ExpGenerator<'env>>(
                 outputs: vec![g.mk_concat_vec(with_elem, suffix, &vec_ty)],
             }
         },
+        "rotate" => {
+            let v = arg(0)?;
+            let rot = arg(1)?;
+            let len = g.mk_len(v.clone());
+            let left = g.mk_slice(v.clone(), zero(), rot.clone(), &vec_ty);
+            let right = g.mk_slice(v.clone(), rot.clone(), len.clone(), &vec_ty);
+            IntrinsicWp {
+                aborts: g.mk_bool_call(Operation::Gt, vec![rot.clone(), len.clone()]),
+                outputs: vec![
+                    typed(0, Operation::Sub, vec![len, rot]),
+                    g.mk_concat_vec(right, left, &vec_ty),
+                ],
+            }
+        },
+        "rotate_slice" => {
+            let v = arg(0)?;
+            let left = arg(1)?;
+            let rot = arg(2)?;
+            let right = arg(3)?;
+            let prefix = g.mk_slice(v.clone(), zero(), left.clone(), &vec_ty);
+            let mid_left = g.mk_slice(v.clone(), left.clone(), rot.clone(), &vec_ty);
+            let mid_right = g.mk_slice(v.clone(), rot.clone(), right.clone(), &vec_ty);
+            let suffix = g.mk_slice(v.clone(), right.clone(), g.mk_len(v.clone()), &vec_ty);
+            let middle = g.mk_concat_vec(mid_right, mid_left, &vec_ty);
+            let post = g.mk_concat_vec(prefix, g.mk_concat_vec(middle, suffix, &vec_ty), &vec_ty);
+            let nontrivial = g.mk_bool_call(Operation::Gt, vec![
+                right.clone(),
+                g.mk_num_add(left.clone(), one()),
+            ]);
+            let output = g.mk_ite(
+                nontrivial.as_ref().clone(),
+                post.as_ref().clone(),
+                v.as_ref().clone(),
+            );
+            IntrinsicWp {
+                aborts: g.mk_or_n(vec![
+                    g.mk_bool_call(Operation::Gt, vec![left.clone(), rot.clone()]),
+                    g.mk_bool_call(Operation::Gt, vec![rot.clone(), right.clone()]),
+                    g.mk_and(
+                        nontrivial,
+                        g.mk_bool_call(Operation::Gt, vec![right.clone(), g.mk_len(v)]),
+                    ),
+                ]),
+                outputs: vec![
+                    typed(0, Operation::Add, vec![left, g.mk_num_sub(right, rot)]),
+                    output,
+                ],
+            }
+        },
+        "move_range" => {
+            let from = arg(0)?;
+            let removal_position = arg(1)?;
+            let length = arg(2)?;
+            let to = arg(3)?;
+            let insert_position = arg(4)?;
+            let removal_end = g.mk_num_add(removal_position.clone(), length);
+            let moved = g.mk_slice(
+                from.clone(),
+                removal_position.clone(),
+                removal_end.clone(),
+                &vec_ty,
+            );
+            let from_post = g.mk_concat_vec(
+                g.mk_slice(from.clone(), zero(), removal_position, &vec_ty),
+                g.mk_slice(
+                    from.clone(),
+                    removal_end.clone(),
+                    g.mk_len(from.clone()),
+                    &vec_ty,
+                ),
+                &vec_ty,
+            );
+            let to_post = g.mk_concat_vec(
+                g.mk_slice(to.clone(), zero(), insert_position.clone(), &vec_ty),
+                g.mk_concat_vec(
+                    moved,
+                    g.mk_slice(
+                        to.clone(),
+                        insert_position.clone(),
+                        g.mk_len(to.clone()),
+                        &vec_ty,
+                    ),
+                    &vec_ty,
+                ),
+                &vec_ty,
+            );
+            IntrinsicWp {
+                aborts: g.mk_or(
+                    g.mk_bool_call(Operation::Gt, vec![removal_end, g.mk_len(from)]),
+                    g.mk_bool_call(Operation::Gt, vec![insert_position, g.mk_len(to)]),
+                ),
+                outputs: vec![from_post, to_post],
+            }
+        },
         _ => return None,
     })
 }
 
-/// Returns the WP description for an intrinsic-map mutator bound to one of
-/// the value-level add/del roles (`map_add_no_override`,
-/// `map_add_override_if_exists`, `map_del_must_exist`,
-/// `map_del_return_key`), phrased over the intrinsic spec functions the map
-/// type declares (`map_spec_set`, `map_spec_del`, `map_spec_get`) and its
-/// declared abort-condition spec function. The reference-returning mutators
-/// (`map_borrow_mut*`, iterator borrows) are not handled.
+/// Calls the spec function `sf_qid` instantiated with `inst`, marking it used
+/// (transitively), or `None` when the arity does not match.
+fn mk_spec_fun_call<'env, G: ExpGenerator<'env>>(
+    env: &GlobalEnv,
+    g: &G,
+    sf_qid: QualifiedId<SpecFunId>,
+    inst: &[Type],
+    call_args: Vec<Exp>,
+) -> Option<Exp> {
+    let sf_decl = env.get_spec_fun(sf_qid);
+    if sf_decl.params.len() != call_args.len() || sf_decl.type_params.len() != inst.len() {
+        return None;
+    }
+    let result_ty = sf_decl.result_type.instantiate(inst);
+    env.add_used_spec_fun_transitive(sf_qid);
+    Some(g.mk_call_with_inst(
+        &result_ty,
+        inst.to_vec(),
+        Operation::SpecFunction(
+            sf_qid.module_id,
+            sf_qid.id,
+            crate::ast::MemoryRange::default(),
+        ),
+        call_args,
+    ))
+}
+
+/// The abort condition of an intrinsic-map function over its pre-state
+/// arguments, as the prover's map model defines it: the declared
+/// abort-condition spec function when the map type binds one, otherwise the
+/// condition of the function's role in the model (the templates in
+/// `boogie-backend/src/prelude/native.bpl`), phrased over the map type's
+/// membership and emptiness spec functions; `false` for a role which never
+/// aborts. `None` when the function is no map intrinsic or its condition
+/// cannot be phrased with what the map type binds.
+pub fn map_intrinsic_aborts<'env, G: ExpGenerator<'env>>(
+    env: &GlobalEnv,
+    g: &G,
+    fun_qid: QualifiedId<FunId>,
+    type_inst: &[Type],
+    args: &[Exp],
+) -> Option<Exp> {
+    use crate::pragmas::{
+        INTRINSIC_FUN_MAP_SPEC_ABORTS_ADD, INTRINSIC_FUN_MAP_SPEC_ABORTS_BORROW,
+        INTRINSIC_FUN_MAP_SPEC_ABORTS_DEL, INTRINSIC_FUN_MAP_SPEC_ABORTS_DESTROY_EMPTY,
+        INTRINSIC_FUN_MAP_SPEC_ABORTS_EMPTY, INTRINSIC_FUN_MAP_SPEC_ABORTS_ITER_BORROW_MUT,
+        INTRINSIC_FUN_MAP_SPEC_HAS_KEY, INTRINSIC_FUN_MAP_SPEC_IS_EMPTY,
+        INTRINSIC_FUN_MAP_SPEC_LEN,
+    };
+    let intrinsics = env.get_intrinsics();
+    let decl = intrinsics.get_decl_for_move_fun(&fun_qid)?;
+    if intrinsics.is_non_aborting_move_fun(&fun_qid) {
+        return Some(g.mk_bool_const(false));
+    }
+    if let Some(abort_fun) = intrinsics.get_abort_spec_fun_for_move_fun(&fun_qid) {
+        return mk_spec_fun_call(env, g, abort_fun, type_inst, args.to_vec());
+    }
+    let role = env
+        .symbol_pool()
+        .string(intrinsics.abort_role_for_move_fun(&fun_qid)?);
+    let role_call = |name: &str, call_args: Vec<Exp>| -> Option<Exp> {
+        mk_spec_fun_call(
+            env,
+            g,
+            decl.lookup_spec_fun(env, name)?,
+            type_inst,
+            call_args,
+        )
+    };
+    let arg = |i: usize| args.get(i).cloned();
+    let has_key = || role_call(INTRINSIC_FUN_MAP_SPEC_HAS_KEY, vec![arg(0)?, arg(1)?]);
+    let is_empty = || role_call(INTRINSIC_FUN_MAP_SPEC_IS_EMPTY, vec![arg(0)?]);
+    match role.as_str() {
+        INTRINSIC_FUN_MAP_SPEC_ABORTS_ADD => has_key(),
+        INTRINSIC_FUN_MAP_SPEC_ABORTS_DEL | INTRINSIC_FUN_MAP_SPEC_ABORTS_BORROW => {
+            Some(g.mk_not(has_key()?))
+        },
+        INTRINSIC_FUN_MAP_SPEC_ABORTS_EMPTY => is_empty(),
+        INTRINSIC_FUN_MAP_SPEC_ABORTS_DESTROY_EMPTY => Some(g.mk_not(is_empty()?)),
+        // The end iterator, or a key not in the map resp. a position out of
+        // range.
+        INTRINSIC_FUN_MAP_SPEC_ABORTS_ITER_BORROW_MUT => {
+            let (it, m) = (arg(0)?, arg(1)?);
+            let (field, payload) = map_iter_payload(env, g, decl, &it)?;
+            let at_end =
+                g.mk_not(g.mk_variant_test(&env.get_struct(field.iter_type), field.variant, it));
+            let missing = if field.is_position {
+                g.mk_bool_call(Operation::Ge, vec![
+                    payload,
+                    role_call(INTRINSIC_FUN_MAP_SPEC_LEN, vec![m])?,
+                ])
+            } else {
+                g.mk_not(role_call(INTRINSIC_FUN_MAP_SPEC_HAS_KEY, vec![m, payload])?)
+            };
+            Some(g.mk_or(at_end, missing))
+        },
+        _ => None,
+    }
+}
+
+/// The iterator field of the map's `map_iter_borrow_mut` binding and its
+/// selection from the iterator `it`: the key of a keyed iterator, the
+/// position of a position-based one.
+fn map_iter_payload<'env, G: ExpGenerator<'env>>(
+    env: &GlobalEnv,
+    g: &G,
+    decl: &IntrinsicDecl,
+    it: &Exp,
+) -> Option<(IterKeyField, Exp)> {
+    let field = decl.iter_key_field(env)?.ok()?;
+    let Type::Struct(mid, sid, iter_inst) =
+        env.get_node_type(it.node_id()).skip_reference().clone()
+    else {
+        return None;
+    };
+    if mid.qualified(sid) != field.iter_type {
+        return None;
+    }
+    let iter_env = env.get_struct(field.iter_type);
+    let selected = g.mk_field_select(&iter_env.get_field(field.field), &iter_inst, it.clone());
+    Some((field, selected))
+}
+
+/// The entry a call to a reference-returning intrinsic borrows mutably:
+/// `vector::borrow_mut`, or an intrinsic-map function bound to
+/// `map_borrow_mut`, `map_borrow_mut_with_default` or `map_iter_borrow_mut`.
+/// All parts are over the call's pre-state arguments. A write through the
+/// returned reference replaces the entry at `index` of the container (see
+/// [`container_write`]).
+pub struct IntrinsicBorrow {
+    pub aborts: Exp,
+    /// The value of the borrowed entry.
+    pub value: Exp,
+    /// The container after the call: unchanged, except that
+    /// `map_borrow_mut_with_default` adds the default entry for a missing
+    /// key.
+    pub container: Exp,
+    /// The vector index or map key of the borrowed entry.
+    pub index: Exp,
+}
+
+/// Returns the [`IntrinsicBorrow`] of a call to `fun_qid`, or `None` when
+/// the function is no such intrinsic or the map type does not bind what its
+/// model needs. Mirrors the templates in `boogie-backend/src/prelude`.
+pub fn intrinsic_borrow_mut<'env, G: ExpGenerator<'env>>(
+    env: &GlobalEnv,
+    g: &G,
+    fun_qid: QualifiedId<FunId>,
+    type_inst: &[Type],
+    args: &[Exp],
+) -> Option<IntrinsicBorrow> {
+    use crate::pragmas::{
+        INTRINSIC_FUN_MAP_BORROW_MUT, INTRINSIC_FUN_MAP_BORROW_MUT_WITH_DEFAULT,
+        INTRINSIC_FUN_MAP_ITER_BORROW_MUT, INTRINSIC_FUN_MAP_SPEC_GET,
+        INTRINSIC_FUN_MAP_SPEC_HAS_KEY, INTRINSIC_FUN_MAP_SPEC_KEY_AT, INTRINSIC_FUN_MAP_SPEC_SET,
+    };
+    let fun_env = env.get_function_opt(fun_qid)?;
+    if fun_env.module_env.is_std_vector() {
+        if env.symbol_pool().string(fun_env.get_name()).as_str() != "borrow_mut" {
+            return None;
+        }
+        let [v, i] = args else {
+            return None;
+        };
+        return Some(IntrinsicBorrow {
+            aborts: g.mk_not(g.mk_in_range_vec(v.clone(), i.clone())),
+            value: g.mk_index(v.clone(), i.clone(), type_inst.first()?),
+            container: v.clone(),
+            index: i.clone(),
+        });
+    }
+    let intrinsics = env.get_intrinsics();
+    let decl = intrinsics.get_decl_for_move_fun(&fun_qid)?;
+    let is_role =
+        |name: &str| intrinsics.is_intrinsic_of_for_move_fun(env.symbol_pool(), &fun_qid, name);
+    let role_call = |name: &str, call_args: Vec<Exp>| -> Option<Exp> {
+        mk_spec_fun_call(
+            env,
+            g,
+            decl.lookup_spec_fun(env, name)?,
+            type_inst,
+            call_args,
+        )
+    };
+    let (index, value, post) = if is_role(INTRINSIC_FUN_MAP_BORROW_MUT) {
+        let [m, k] = args else {
+            return None;
+        };
+        let value = role_call(INTRINSIC_FUN_MAP_SPEC_GET, vec![m.clone(), k.clone()])?;
+        (k.clone(), value, m.clone())
+    } else if is_role(INTRINSIC_FUN_MAP_BORROW_MUT_WITH_DEFAULT) {
+        let [m, k, default] = args else {
+            return None;
+        };
+        let present = role_call(INTRINSIC_FUN_MAP_SPEC_HAS_KEY, vec![m.clone(), k.clone()])?;
+        let value = g.mk_ite(
+            present.as_ref().clone(),
+            role_call(INTRINSIC_FUN_MAP_SPEC_GET, vec![m.clone(), k.clone()])?
+                .as_ref()
+                .clone(),
+            default.as_ref().clone(),
+        );
+        let post = g.mk_ite(
+            present.as_ref().clone(),
+            m.as_ref().clone(),
+            role_call(INTRINSIC_FUN_MAP_SPEC_SET, args.to_vec())?
+                .as_ref()
+                .clone(),
+        );
+        (k.clone(), value, post)
+    } else if is_role(INTRINSIC_FUN_MAP_ITER_BORROW_MUT) {
+        let [it, m] = args else {
+            return None;
+        };
+        let (field, payload) = map_iter_payload(env, g, decl, it)?;
+        let key = if field.is_position {
+            role_call(INTRINSIC_FUN_MAP_SPEC_KEY_AT, vec![m.clone(), payload])?
+        } else {
+            payload
+        };
+        let value = role_call(INTRINSIC_FUN_MAP_SPEC_GET, vec![m.clone(), key.clone()])?;
+        (key, value, m.clone())
+    } else {
+        return None;
+    };
+    Some(IntrinsicBorrow {
+        aborts: map_intrinsic_aborts(env, g, fun_qid, type_inst, args)?,
+        value,
+        container: post,
+        index,
+    })
+}
+
+/// The container `container` of type `container_ty` with the entry at `index`
+/// replaced by `value`: `update(container, index, value)` for a vector, the
+/// map type's `map_spec_set` for an intrinsic map. This is the write-back
+/// through a reference an [`IntrinsicBorrow`] borrowed. `None` for any other
+/// type, or a map type which does not bind `map_spec_set`.
+pub fn container_write<'env, G: ExpGenerator<'env>>(
+    env: &GlobalEnv,
+    g: &G,
+    container_ty: &Type,
+    container: Exp,
+    index: Exp,
+    value: Exp,
+) -> Option<Exp> {
+    match container_ty.skip_reference() {
+        Type::Vector(_) => {
+            Some(g.mk_update_vec(container, index, value, container_ty.skip_reference()))
+        },
+        Type::Struct(mid, sid, inst) => {
+            let decl = env
+                .get_intrinsics()
+                .get_decl_for_struct(&mid.qualified(*sid))?;
+            mk_spec_fun_call(
+                env,
+                g,
+                decl.lookup_spec_fun(env, crate::pragmas::INTRINSIC_FUN_MAP_SPEC_SET)?,
+                inst,
+                vec![container, index, value],
+            )
+        },
+        _ => None,
+    }
+}
+
+/// The type of the indices of a container [`container_write`] updates:
+/// `u64` for a vector, the key type for an intrinsic map.
+pub fn container_index_type(env: &GlobalEnv, container_ty: &Type) -> Option<Type> {
+    match container_ty.skip_reference() {
+        Type::Vector(_) => Some(Type::Primitive(crate::ty::PrimitiveType::U64)),
+        Type::Struct(mid, sid, inst) => {
+            env.get_intrinsics()
+                .get_decl_for_struct(&mid.qualified(*sid))?;
+            inst.first().cloned()
+        },
+        _ => None,
+    }
+}
+
+/// The intrinsic-map roles [`map_intrinsic_wp`] describes.
+const MAP_INTRINSIC_WP_ROLES: [&str; 7] = [
+    crate::pragmas::INTRINSIC_FUN_MAP_ADD_NO_OVERRIDE,
+    crate::pragmas::INTRINSIC_FUN_MAP_ADD_OVERRIDE_IF_EXISTS,
+    crate::pragmas::INTRINSIC_FUN_MAP_UPSERT,
+    crate::pragmas::INTRINSIC_FUN_MAP_DEL_MUST_EXIST,
+    crate::pragmas::INTRINSIC_FUN_MAP_DEL_RETURN_KEY,
+    crate::pragmas::INTRINSIC_FUN_MAP_REMOVE_OR_NONE,
+    crate::pragmas::INTRINSIC_FUN_MAP_GET,
+];
+
+/// Whether the function is bound to a role [`map_intrinsic_wp`] describes.
+pub fn has_map_intrinsic_wp(env: &GlobalEnv, fun_qid: QualifiedId<FunId>) -> bool {
+    MAP_INTRINSIC_WP_ROLES.iter().any(|name| {
+        env.get_intrinsics()
+            .is_intrinsic_of_for_move_fun(env.symbol_pool(), &fun_qid, name)
+    })
+}
+
+/// Returns the WP description for an intrinsic-map function bound to one of
+/// the value-level roles (`map_add_no_override`, `map_add_override_if_exists`,
+/// `map_upsert`, `map_del_must_exist`, `map_del_return_key`,
+/// `map_remove_or_none`, `map_get`), phrased over the intrinsic spec
+/// functions the map type declares (`map_spec_set`, `map_spec_del`,
+/// `map_spec_get`, `map_spec_has_key`), its declared abort-condition spec
+/// function, and `option::spec_some`/`spec_none` for `Option` results. The
+/// reference-returning mutators (`map_borrow_mut*`, iterator borrows) are not
+/// handled.
 ///
 /// `args` are the pre-state argument expressions in source order, at the
 /// value level (references read back to values). Returns `None` when the
@@ -538,53 +1111,60 @@ pub fn map_intrinsic_wp<'env, G: ExpGenerator<'env>>(
 ) -> Option<IntrinsicWp> {
     use crate::pragmas::{
         INTRINSIC_FUN_MAP_ADD_NO_OVERRIDE, INTRINSIC_FUN_MAP_ADD_OVERRIDE_IF_EXISTS,
-        INTRINSIC_FUN_MAP_DEL_MUST_EXIST, INTRINSIC_FUN_MAP_DEL_RETURN_KEY,
-        INTRINSIC_FUN_MAP_SPEC_DEL, INTRINSIC_FUN_MAP_SPEC_GET, INTRINSIC_FUN_MAP_SPEC_SET,
+        INTRINSIC_FUN_MAP_DEL_MUST_EXIST, INTRINSIC_FUN_MAP_DEL_RETURN_KEY, INTRINSIC_FUN_MAP_GET,
+        INTRINSIC_FUN_MAP_REMOVE_OR_NONE, INTRINSIC_FUN_MAP_SPEC_DEL, INTRINSIC_FUN_MAP_SPEC_GET,
+        INTRINSIC_FUN_MAP_SPEC_HAS_KEY, INTRINSIC_FUN_MAP_SPEC_SET, INTRINSIC_FUN_MAP_UPSERT,
     };
     let intrinsics = env.get_intrinsics();
     let decl = intrinsics.get_decl_for_move_fun(&fun_qid)?;
     let pool = env.symbol_pool();
-    let role = [
-        INTRINSIC_FUN_MAP_ADD_NO_OVERRIDE,
-        INTRINSIC_FUN_MAP_ADD_OVERRIDE_IF_EXISTS,
-        INTRINSIC_FUN_MAP_DEL_MUST_EXIST,
-        INTRINSIC_FUN_MAP_DEL_RETURN_KEY,
-    ]
-    .into_iter()
-    .find(|name| intrinsics.is_intrinsic_of_for_move_fun(pool, &fun_qid, name))?;
-    // Builds a call to a declared intrinsic spec function, instantiated
-    // with the map instantiation (all these spec functions are generic
-    // exactly over the key and value type).
-    let spec_call = |sf_qid: QualifiedId<SpecFunId>, call_args: Vec<Exp>| -> Option<Exp> {
-        let sf_decl = env.get_spec_fun(sf_qid);
-        if sf_decl.params.len() != call_args.len() || sf_decl.type_params.len() != type_inst.len() {
+    let role = MAP_INTRINSIC_WP_ROLES
+        .into_iter()
+        .find(|name| intrinsics.is_intrinsic_of_for_move_fun(pool, &fun_qid, name))?;
+    let spec_call = |sf_qid: QualifiedId<SpecFunId>, inst: &[Type], call_args: Vec<Exp>| {
+        mk_spec_fun_call(env, g, sf_qid, inst, call_args)
+    };
+    // Calls a declared intrinsic spec function, instantiated with the map
+    // instantiation (all these spec functions are generic exactly over the
+    // key and value type).
+    let role_call = |name: &str, call_args: Vec<Exp>| -> Option<Exp> {
+        spec_call(decl.lookup_spec_fun(env, name)?, type_inst, call_args)
+    };
+    let declared_abort = || map_intrinsic_aborts(env, g, fun_qid, type_inst, args);
+    let arg = |i: usize| args.get(i).cloned();
+    // The entry of key `args[1]` in map `args[0]` as the function's declared
+    // `Option` result: `spec_some(spec_get(m, k))` if present, else
+    // `spec_none()`.
+    let has_key = || role_call(INTRINSIC_FUN_MAP_SPEC_HAS_KEY, vec![arg(0)?, arg(1)?]);
+    let entry_option = || -> Option<Exp> {
+        let result_ty = env
+            .get_function(fun_qid)
+            .get_result_type()
+            .instantiate(type_inst);
+        let Type::Struct(option_mid, _, elem_inst) = &result_ty else {
+            return None;
+        };
+        let option_module = env.get_module(*option_mid);
+        if !option_module.is_option() {
             return None;
         }
-        let result_ty = sf_decl.result_type.instantiate(type_inst);
-        env.add_used_spec_fun_transitive(sf_qid);
-        Some(g.mk_call_with_inst(
-            &result_ty,
-            type_inst.to_vec(),
-            Operation::SpecFunction(
-                sf_qid.module_id,
-                sf_qid.id,
-                crate::ast::MemoryRange::default(),
-            ),
-            call_args,
+        let value = role_call(INTRINSIC_FUN_MAP_SPEC_GET, vec![arg(0)?, arg(1)?])?;
+        let some = spec_call(
+            find_spec_fun_in_module(&option_module, "spec_some")?,
+            elem_inst,
+            vec![value],
+        )?;
+        let none = spec_call(
+            find_spec_fun_in_module(&option_module, "spec_none")?,
+            elem_inst,
+            vec![],
+        )?;
+        Some(g.mk_ite(
+            has_key()?.as_ref().clone(),
+            some.as_ref().clone(),
+            none.as_ref().clone(),
         ))
     };
-    let role_call = |name: &str, call_args: Vec<Exp>| -> Option<Exp> {
-        spec_call(decl.lookup_spec_fun(env, name)?, call_args)
-    };
-    // The declared abort condition over the pre-state arguments; the abort
-    // spec function's parameters mirror the Move function's (value-level).
-    let declared_abort = || -> Option<Exp> {
-        spec_call(
-            intrinsics.get_abort_spec_fun_for_move_fun(&fun_qid)?,
-            args.to_vec(),
-        )
-    };
-    let arg = |i: usize| args.get(i).cloned();
     Some(match role {
         // add(m, k, v): post-state `spec_set(m, k, v)`; aborts per the
         // declared condition (key already present) resp. never for the
@@ -601,6 +1181,20 @@ pub fn map_intrinsic_wp<'env, G: ExpGenerator<'env>>(
             IntrinsicWp {
                 aborts,
                 outputs: vec![role_call(INTRINSIC_FUN_MAP_SPEC_SET, args.to_vec())?],
+            }
+        },
+        // upsert(m, k, v): returns the previous entry; post-state
+        // `spec_set(m, k, v)`; never aborts.
+        INTRINSIC_FUN_MAP_UPSERT => {
+            if args.len() != 3 {
+                return None;
+            }
+            IntrinsicWp {
+                aborts: g.mk_bool_const(false),
+                outputs: vec![
+                    entry_option()?,
+                    role_call(INTRINSIC_FUN_MAP_SPEC_SET, args.to_vec())?,
+                ],
             }
         },
         // del(m, k): returns `spec_get(m, k)` (with the key first for the
@@ -621,6 +1215,34 @@ pub fn map_intrinsic_wp<'env, G: ExpGenerator<'env>>(
             IntrinsicWp {
                 aborts: declared_abort()?,
                 outputs,
+            }
+        },
+        // remove_or_none(m, k): returns the entry; the map is unchanged when
+        // the key is absent; never aborts.
+        INTRINSIC_FUN_MAP_REMOVE_OR_NONE => {
+            if args.len() != 2 {
+                return None;
+            }
+            let post = g.mk_ite(
+                has_key()?.as_ref().clone(),
+                role_call(INTRINSIC_FUN_MAP_SPEC_DEL, args.to_vec())?
+                    .as_ref()
+                    .clone(),
+                arg(0)?.as_ref().clone(),
+            );
+            IntrinsicWp {
+                aborts: g.mk_bool_const(false),
+                outputs: vec![entry_option()?, post],
+            }
+        },
+        // get(m, k): returns the entry; never aborts.
+        INTRINSIC_FUN_MAP_GET => {
+            if args.len() != 2 {
+                return None;
+            }
+            IntrinsicWp {
+                aborts: g.mk_bool_const(false),
+                outputs: vec![entry_option()?],
             }
         },
         _ => return None,

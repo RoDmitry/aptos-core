@@ -266,9 +266,9 @@ pub struct PackClosureOp {
 pub struct CallClosureOp {
     /// Frame slot holding the closure heap pointer.
     pub closure_src: FrameOffset,
-    /// Sources (in caller's frame) of the provided (non-captured) arguments,
-    /// in the order that `mask.is_captured(i)` is false — i.e. ascending `i`
-    /// through the function's parameter list.
+    /// Non-captured argument sources, all within the caller's data region.
+    /// Ordered by ascending parameter index `i` where `mask.is_captured(i)`
+    /// is false.
     pub provided_args: Vec<SizedSlot>,
 }
 
@@ -444,7 +444,7 @@ pub enum MicroOp {
         rhs: FrameOffset,
     },
 
-    /// `dst = src / imm` (u64). Aborts if `imm == 0`.
+    /// `dst = src / imm` (u64). Unchecked; lowering guarantees `imm != 0`.
     DivU64Imm {
         dst: FrameOffset,
         src: FrameOffset,
@@ -459,7 +459,7 @@ pub enum MicroOp {
         rhs: FrameOffset,
     },
 
-    /// `dst = src % imm` (u64). Aborts if `imm == 0`.
+    /// `dst = src % imm` (u64). Unchecked; lowering guarantees `imm != 0`.
     ModU64Imm {
         dst: FrameOffset,
         src: FrameOffset,
@@ -500,7 +500,7 @@ pub enum MicroOp {
         rhs: FrameOffset,
     },
 
-    /// `dst = src << imm` (u64). Aborts if `imm >= 64`.
+    /// `dst = src << imm` (u64). Unchecked; lowering guarantees `imm < 64`.
     ShlU64Imm {
         dst: FrameOffset,
         src: FrameOffset,
@@ -515,7 +515,8 @@ pub enum MicroOp {
         rhs: FrameOffset,
     },
 
-    /// `dst = src >> imm` (u64, logical right shift). Aborts if `imm >= 64`.
+    /// `dst = src >> imm` (u64, logical right shift).
+    /// Unchecked; lowering guarantees `imm < 64`.
     ShrU64Imm {
         dst: FrameOffset,
         src: FrameOffset,

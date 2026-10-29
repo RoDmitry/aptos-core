@@ -3,6 +3,7 @@
 
 //! Capture, replay, and interpretation support for solver timeout analysis.
 
+use crate::process_group::ProcessGroupChild;
 use codespan::{ColumnIndex, LineIndex};
 use move_model::{
     code_writer::CodeWriter,
@@ -274,14 +275,14 @@ async fn replay_capture(
             );
         },
     };
-    let child = Command::new(z3_exe)
+    let mut command = Command::new(z3_exe);
+    command
         .arg("-st")
         .arg(&replay_path)
         .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn();
-    let mut child = match child {
+        .stderr(Stdio::from(stderr_file));
+    let child = ProcessGroupChild::spawn(&mut command);
+    let child = match child {
         Ok(child) => child,
         Err(err) => {
             log::debug!("cannot launch timeout-analysis Z3 replay: {}", err);
@@ -305,11 +306,7 @@ async fn replay_capture(
                 log::debug!("cannot wait for timeout-analysis Z3 replay: {}", err);
                 (false, false)
             },
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                (false, true)
-            },
+            Err(_) => (false, true),
         };
     let stdout = read_lossy(&stdout_path);
     let stderr = read_lossy(&stderr_path);
@@ -454,8 +451,11 @@ fn resolve_spec_fun_qid(fields: &[&str], env: &GlobalEnv) -> Option<String> {
 fn humanize_legacy_definition_qid(base: &str) -> String {
     let symbol = base.strip_suffix(".def").unwrap_or(base);
     let symbol = symbol.strip_prefix('$').unwrap_or(symbol);
+    // Drop the leading address component of the generated name, which carries no
+    // information for a reader. `.` is the component separator of generated names
+    // (see `boogie_module_name`), so the address is the first component.
     let symbol = symbol
-        .split_once('_')
+        .split_once('.')
         .filter(|(prefix, _)| !prefix.is_empty() && prefix.chars().all(|ch| ch.is_ascii_hexdigit()))
         .map_or(symbol, |(_, rest)| rest);
     format!("generated definition for {}", symbol)
@@ -803,7 +803,7 @@ mod tests {
         assert!(vc_matches(Some("p"), Some("p")));
         assert!(vc_matches(Some("p"), Some("p_split0")));
         assert!(!vc_matches(Some("p"), Some("other_split0")));
-        assert_eq!(normalize_vc_id("'$1_p$verify'."), "$1_p$verify");
+        assert_eq!(normalize_vc_id("'$1.p.$verify'."), "$1.p.$verify");
     }
 
     #[test]
@@ -989,8 +989,8 @@ mod tests {
     #[test]
     fn legacy_definition_qids_are_humanized() {
         assert_eq!(
-            humanize_legacy_definition_qid("$1_staking_contract_spec_fold.def"),
-            "generated definition for staking_contract_spec_fold"
+            humanize_legacy_definition_qid("$1.staking_contract.spec_fold.def"),
+            "generated definition for staking_contract.spec_fold"
         );
         assert_eq!(
             humanize_legacy_definition_qid("$spec_fun.def"),

@@ -5,7 +5,7 @@ use crate::{
     ast::{
         AbortKind, AccessSpecifierKind, AddressSpecifier, Condition, ConditionKind, Exp, ExpData,
         FrameSpec, LambdaCaptureKind, MemoryRange, Operation, Pattern, PropertyBag, PropertyValue,
-        QuantKind, ResourceSpecifier, Spec, SpecVarDecl, TempIndex, Value,
+        QuantKind, ResourceSpecifier, Spec, SpecBlockTarget, SpecVarDecl, TempIndex, Value,
     },
     code_writer::CodeWriter,
     emit, emitln,
@@ -355,7 +355,7 @@ impl<'a> Sourcifier<'a> {
     pub fn print_exp_for_fun_spec(&self, fun_env: &FunctionEnv, exp: &Exp) {
         let exp_sourcifier =
             ExpSourcifier::for_fun_spec(self, fun_env, fun_env.get_type_display_ctx(), self.amend);
-        exp_sourcifier.print_exp(Prio::General, false, exp);
+        exp_sourcifier.print_exp(Prio::General, false, &exp.restore_lambda_calls(self.env()));
     }
 
     /// Destructs and returns the result
@@ -1457,7 +1457,21 @@ impl<'a> Sourcifier<'a> {
 
     /// Prints a spec block for a function, including the repeated signature.
     pub fn print_fun_spec(&self, fun_env: &FunctionEnv) {
-        let spec = fun_env.get_spec();
+        self.print_fun_spec_with_signature_type_display_ctx(fun_env, fun_env.get_type_display_ctx())
+    }
+
+    /// Prints a spec block with an explicitly selected type-display context for
+    /// its repeated signature. The specification body keeps its normal source
+    /// context so callers can make just the signature unambiguous.
+    pub fn print_fun_spec_with_signature_type_display_ctx(
+        &self,
+        fun_env: &FunctionEnv,
+        signature_tctx: TypeDisplayContext<'_>,
+    ) {
+        let spec = fun_env.get_spec().restore_lambda_calls(
+            self.env(),
+            &SpecBlockTarget::Function(fun_env.module_env.get_id(), fun_env.get_id()),
+        );
         let has_frame = spec
             .frame_spec
             .as_ref()
@@ -1472,7 +1486,7 @@ impl<'a> Sourcifier<'a> {
 
         emitln!(self.writer);
         emit!(self.writer, "spec ");
-        self.print_fun_signature(fun_env);
+        self.print_fun_signature(fun_env, &signature_tctx);
         emitln!(self.writer, " {");
 
         self.writer.indent();
@@ -1518,7 +1532,7 @@ impl<'a> Sourcifier<'a> {
     }
 
     /// Prints just the function signature (name, type params, params, return type).
-    fn print_fun_signature(&self, fun_env: &FunctionEnv) {
+    fn print_fun_signature(&self, fun_env: &FunctionEnv, tctx: &TypeDisplayContext<'_>) {
         let name = Sourcifier::amend_fun_name(self.env(), self.sym(fun_env.get_name()), self.amend);
         emit!(
             self.writer,
@@ -1526,19 +1540,14 @@ impl<'a> Sourcifier<'a> {
             name,
             self.type_params(fun_env.get_type_parameters_ref())
         );
-        let tctx = fun_env.get_type_display_ctx();
         let params = fun_env
             .get_parameters()
             .into_iter()
-            .map(|Parameter(sym, ty, _)| format!("{}: {}", self.sym(sym), ty.display(&tctx)))
+            .map(|Parameter(sym, ty, _)| format!("{}: {}", self.sym(sym), ty.display(tctx)))
             .join(", ");
         emit!(self.writer, "({})", params);
         if fun_env.get_return_count() > 0 {
-            emit!(
-                self.writer,
-                ": {}",
-                fun_env.get_result_type().display(&tctx)
-            )
+            emit!(self.writer, ": {}", fun_env.get_result_type().display(tctx))
         }
     }
 
@@ -2304,20 +2313,23 @@ impl<'a> ExpSourcifier<'a> {
             },
             Quant(_, kind, ranges, triggers, where_clause, body) => {
                 self.parenthesize(context_prio, Prio::General, || {
-                    self.print_quant_header(kind, ranges, triggers, where_clause);
-                    self.print_exp(Prio::General, false, body);
+                    self.print_quant(kind, ranges, triggers, where_clause, || {
+                        self.print_exp(Prio::General, false, body)
+                    });
                 })
             },
         }
     }
 
-    /// Print quantifier header (keyword, ranges, triggers, where clause, and trailing `: `).
-    fn print_quant_header(
+    /// Print a quantifier: keyword, ranges, triggers, where clause, and the body
+    /// `print_body` prints.
+    fn print_quant(
         &self,
         kind: &QuantKind,
         ranges: &[(Pattern, Exp)],
         triggers: &[Vec<Exp>],
         where_clause: &Option<Exp>,
+        print_body: impl Fn(),
     ) {
         let keyword = match kind {
             QuantKind::Forall => "forall",
@@ -2351,21 +2363,39 @@ impl<'a> ExpSourcifier<'a> {
                 self.print_exp(Prio::General, false, range);
             }
         }
-        for trigger in triggers {
-            emit!(self.wr(), " {");
-            for (i, t) in trigger.iter().enumerate() {
-                if i > 0 {
-                    emit!(self.wr(), ", ");
+        match kind {
+            QuantKind::Forall | QuantKind::Exists => {
+                for trigger in triggers {
+                    emit!(self.wr(), " {");
+                    for (i, t) in trigger.iter().enumerate() {
+                        if i > 0 {
+                            emit!(self.wr(), ", ");
+                        }
+                        self.print_exp(Prio::General, false, t);
+                    }
+                    emit!(self.wr(), "}");
                 }
-                self.print_exp(Prio::General, false, t);
-            }
-            emit!(self.wr(), "}");
+                if let Some(where_exp) = where_clause {
+                    emit!(self.wr(), " where ");
+                    self.print_exp(Prio::General, false, where_exp);
+                }
+                emit!(self.wr(), ": ");
+                print_body();
+            },
+            QuantKind::Choose | QuantKind::ChooseMin => {
+                // `choose` has no separate condition: `where` introduces the
+                // body it chooses by.
+                emit!(self.wr(), " where ");
+                if let Some(where_exp) = where_clause {
+                    self.print_exp(Prio::LogicalAnd, false, where_exp);
+                    emit!(self.wr(), " && (");
+                    print_body();
+                    emit!(self.wr(), ")");
+                } else {
+                    print_body();
+                }
+            },
         }
-        if let Some(where_exp) = where_clause {
-            emit!(self.wr(), " where ");
-            self.print_exp(Prio::General, false, where_exp);
-        }
-        emit!(self.wr(), ": ");
     }
 
     /// Print a memory label with its name (from GlobalEnv) or fallback to numeric ID.
@@ -3041,6 +3071,11 @@ impl<'a> ExpSourcifier<'a> {
                 self.print_exp(Prio::General, false, &args[1]);
                 emit!(self.wr(), ")")
             }),
+            Operation::ReverseVec => self.parenthesize(context_prio, Prio::Postfix, || {
+                emit!(self.wr(), "reverse_vector(");
+                self.print_exp(Prio::General, false, &args[0]);
+                emit!(self.wr(), ")")
+            }),
             Operation::IndexOfVec => self.parenthesize(context_prio, Prio::Postfix, || {
                 emit!(self.wr(), "index_of(");
                 self.print_exp(Prio::General, false, &args[0]);
@@ -3573,8 +3608,9 @@ impl<'a> ExpSourcifier<'a> {
                 if is_simple_quant(ranges, triggers, where_clause) =>
             {
                 self.parenthesize(prio, Prio::General, || {
-                    self.print_quant_header(kind, ranges, triggers, where_clause);
-                    self.print_exp_without_label(Prio::General, body);
+                    self.print_quant(kind, ranges, triggers, where_clause, || {
+                        self.print_exp_without_label(Prio::General, body)
+                    });
                 })
             },
             _ => self.print_exp(prio, false, exp),

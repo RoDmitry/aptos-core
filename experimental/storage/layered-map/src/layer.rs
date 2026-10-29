@@ -80,7 +80,7 @@ impl<K: ArcAsyncDrop, V: ArcAsyncDrop> LayerInner<K, V> {
     }
 
     fn drain_children_for_drop(&self) -> Vec<Arc<Self>> {
-        self.children.lock().drain(..).collect()
+        std::mem::take(&mut *self.children.lock())
     }
 
     fn log_layer(&self, event: &'static str) {
@@ -182,7 +182,7 @@ impl<K: ArcAsyncDrop, V: ArcAsyncDrop> MapLayer<K, V> {
         }
     }
 
-    pub(crate) fn layer(&self) -> u64 {
+    pub fn layer(&self) -> u64 {
         self.inner.layer
     }
 

@@ -24,6 +24,7 @@ use crate::{
         ABORTS_IF_IS_STRICT_PRAGMA, CONDITION_ABSTRACT_PROP, CONDITION_CONCRETE_PROP,
         CONDITION_EXPORT_PROP, CONDITION_INJECTED_PROP,
     },
+    spec_derivation,
     symbol::Symbol,
     ty::{PrimitiveType, Type, BOOL_TYPE},
     well_known,
@@ -71,6 +72,10 @@ pub struct SpecTranslator<'a, 'b, T: ExpGenerator<'a>> {
     /// function entry (`saved_params`), `Some(label)` the matching
     /// `SaveStateAnchor` marker (`anchored_saved_params`).
     current_anchor: Option<MemoryLabel>,
+    /// Whether we translate an inline property (an assertion or loop invariant in the
+    /// function body), where a parameter denotes its current value, which the body may
+    /// have reassigned, rather than its value at entry.
+    in_inline_property: bool,
 }
 
 /// A flattened proof action produced by translating a structured `Proof` tree.
@@ -371,6 +376,7 @@ impl<'a, 'b, T: ExpGenerator<'a>> SpecTranslator<'a, 'b, T> {
             in_old: false,
             shared_old_label: None,
             current_anchor: None,
+            in_inline_property: false,
         };
         translator.translate_spec(for_call);
         translator.result
@@ -398,6 +404,7 @@ impl<'a, 'b, T: ExpGenerator<'a>> SpecTranslator<'a, 'b, T> {
             in_old: false,
             shared_old_label: None,
             current_anchor: None,
+            in_inline_property: false,
         };
         // Clone invariants so `inst` lives for the entire loop
         let invariants = invariants.collect_vec();
@@ -435,6 +442,7 @@ impl<'a, 'b, T: ExpGenerator<'a>> SpecTranslator<'a, 'b, T> {
             in_old: false,
             shared_old_label: None,
             current_anchor: None,
+            in_inline_property: true,
         };
 
         // Handle updating of global spec variables
@@ -626,6 +634,86 @@ impl<'a, 'b, T: ExpGenerator<'a>> SpecTranslator<'a, 'b, T> {
             self.result
                 .emits
                 .push((cond.loc.clone(), event_exp, handle_exp, cond_exp));
+        }
+
+        self.save_labeled_memory_at_entry();
+    }
+
+    /// A state label is defined by the memories its defining condition
+    /// changes; any other memory at that label is the one of the label's
+    /// pre-state, which for an unlabeled start is the entry snapshot. So each
+    /// memory read at a state label is also saved in the entry snapshot.
+    fn save_labeled_memory_at_entry(&mut self) {
+        let Some(old_label) = self.shared_old_label else {
+            return;
+        };
+        let env = self.builder.global_env();
+        let mut memories = BTreeSet::new();
+        let result = &self.result;
+        let exps = result
+            .pre
+            .iter()
+            .chain(&result.post)
+            .chain(&result.modifies)
+            .map(|(_, e)| e)
+            .chain(
+                result
+                    .aborts
+                    .iter()
+                    .flat_map(|(_, e, c)| std::iter::once(e).chain(c)),
+            )
+            .chain(result.lets.iter().map(|(_, _, _, e)| e))
+            .chain(result.updates.iter().flat_map(|(_, l, r)| [l, r]))
+            .chain(
+                result
+                    .emits
+                    .iter()
+                    .flat_map(|(_, e, h, c)| [e, h].into_iter().chain(c)),
+            );
+        for exp in exps {
+            exp.visit_pre_order(&mut |e| {
+                let ExpData::Call(id, oper, args) = e else {
+                    return true;
+                };
+                let labeled = |range: &MemoryRange| range.labels().any(|l| l != old_label);
+                match oper {
+                    Operation::Global(Some(l)) | Operation::Exists(Some(l)) if *l != old_label => {
+                        memories.insert(self.builder.get_memory_of_node(*id));
+                    },
+                    Operation::SpecPublish(range)
+                    | Operation::SpecRemove(range)
+                    | Operation::SpecUpdate(range)
+                        if labeled(range) =>
+                    {
+                        memories.insert(self.builder.get_memory_of_node(*id));
+                    },
+                    Operation::SpecFunction(mid, fid, range) if labeled(range) => {
+                        let inst = env.get_node_instantiation(*id);
+                        memories.extend(
+                            env.get_module(*mid)
+                                .get_spec_fun(*fid)
+                                .used_memory_instantiated(&inst),
+                        );
+                    },
+                    Operation::Behavior(_, range) if labeled(range) => {
+                        if let Some(ExpData::Call(cid, Operation::Closure(mid, fid, _), _)) =
+                            args.first().map(|a| a.as_ref())
+                        {
+                            let inst = env.get_node_instantiation(*cid);
+                            memories.extend(spec_derivation::behavioral_target_memory(
+                                env,
+                                mid.qualified(*fid),
+                                &inst,
+                            ));
+                        }
+                    },
+                    _ => {},
+                }
+                true
+            });
+        }
+        for memory in memories {
+            self.result.saved_memory.insert((memory, old_label));
         }
     }
 
@@ -938,6 +1026,42 @@ impl<'a, 'b, T: ExpGenerator<'a>> SpecTranslator<'a, 'b, T> {
         let lemma = module_env.get_lemma(qid.id);
         let params = lemma.params.clone();
         let conditions = lemma.conditions.clone();
+        let applied_measure = lemma.measure(env);
+        let applied_group = lemma.recursion_group;
+
+        // An application within the lemma's own recursion group must decrease
+        // the measure; see doc/dev/lemma_well_foundedness.md.
+        if let Some(enclosing) = self.enclosing_lemma() {
+            let (enclosing_group, enclosing_measure) = {
+                let env = self.builder.global_env();
+                let module_env = env.get_module(enclosing.module_id);
+                let decl = module_env.get_lemma(enclosing.id);
+                (decl.recursion_group, decl.measure(env))
+            };
+            let same_group = applied_group.is_some()
+                && enclosing.module_id == qid.module_id
+                && enclosing_group == applied_group;
+            if same_group {
+                let current: Vec<Exp> = enclosing_measure
+                    .iter()
+                    .map(|e| self.translate_exp(e, false))
+                    .collect();
+                let env = self.builder.global_env();
+                let next: Vec<Exp> = applied_measure
+                    .iter()
+                    .map(|e| Self::substitute_lemma_params(env, &params, args, e))
+                    .collect();
+                let decreases = self.mk_lexicographic_decrease(loc, &next, &current);
+                let guarded = self.guard_proof_exp(decreases, path_cond);
+                self.push_proof_action(
+                    loc.clone(),
+                    ProofAction::Assert(
+                        guarded,
+                        "recursive lemma application does not decrease the measure".to_string(),
+                    ),
+                );
+            }
+        }
 
         // Process requires first (assert), then ensures (assume), to avoid
         // assuming conclusions before checking premises when conditions are
@@ -962,6 +1086,51 @@ impl<'a, 'b, T: ExpGenerator<'a>> SpecTranslator<'a, 'b, T> {
             let subst_exp = Self::substitute_lemma_params(env, &params, args, &cond.exp);
             let guarded = self.guard_proof_exp(subst_exp, path_cond);
             self.push_proof_action(loc.clone(), ProofAction::Assume(guarded));
+        }
+    }
+
+    /// The lemma whose proof is being translated, if the current function is
+    /// a lemma's synthetic function.
+    fn enclosing_lemma(&self) -> Option<QualifiedId<crate::ast::LemmaId>> {
+        if !self.fun_env.is_lemma() {
+            return None;
+        }
+        let module_env = &self.fun_env.module_env;
+        module_env
+            .find_lemma_by_name(self.fun_env.get_name())
+            .map(|(id, _)| module_env.get_id().qualified(id))
+    }
+
+    /// `next <_lex current`, well-founded by bounding the component that
+    /// strictly decreases: `(n0 < c0 && 0 <= c0) || (n0 == c0 && (n1 < c1 && 0 <= c1)) || ...`
+    fn mk_lexicographic_decrease(&self, loc: &Loc, next: &[Exp], current: &[Exp]) -> Exp {
+        let env = self.builder.global_env();
+        let zero = || {
+            ExpData::Value(
+                env.new_node(loc.clone(), crate::ty::NUM_TYPE),
+                crate::ast::Value::Number(0.into()),
+            )
+            .into_exp()
+        };
+        let mut disjuncts = vec![];
+        for k in 0..next.len().min(current.len()) {
+            let mut conjuncts: Vec<Exp> = (0..k)
+                .map(|j| self.builder.mk_eq(next[j].clone(), current[j].clone()))
+                .collect();
+            conjuncts.push(
+                self.builder
+                    .mk_bool_call(Operation::Lt, vec![next[k].clone(), current[k].clone()]),
+            );
+            conjuncts.push(
+                self.builder
+                    .mk_bool_call(Operation::Le, vec![zero(), current[k].clone()]),
+            );
+            disjuncts.push(self.builder.mk_and_n(conjuncts));
+        }
+        if disjuncts.is_empty() {
+            self.builder.mk_bool_const(false)
+        } else {
+            self.builder.mk_or_n(disjuncts)
         }
     }
 
@@ -1052,6 +1221,15 @@ impl<'a, 'b, T: ExpGenerator<'a>> SpecTranslator<'a, 'b, T> {
     }
 
     /// Returns the temporary's old-state snapshot in the current anchor scope.
+    /// Whether `exp` reads a parameter of the function. In an inline property the body may
+    /// have reassigned it, so `old` of it is the entry value rather than a no-op.
+    fn mentions_parameter(&self, exp: &Exp) -> bool {
+        let param_count = self.fun_env.get_parameter_count();
+        exp.used_temporaries()
+            .into_iter()
+            .any(|idx| idx < param_count)
+    }
+
     fn save_param(&mut self, idx: TempIndex) -> TempIndex {
         let saved_opt = match self.current_anchor {
             None => self.result.saved_params.get(&idx),
@@ -1284,6 +1462,7 @@ impl<'a, T: ExpGenerator<'a>> ExpRewriterFunctions for SpecTranslator<'a, '_, T>
                 if self.current_anchor.is_none()
                     && arg.is_pure(self.builder.global_env())
                     && !is_behavior
+                    && !(self.in_inline_property && self.mentions_parameter(arg))
                 {
                     let loc = self.builder.global_env().get_node_loc(*id);
                     // Compute labels for any sub-expressions which are included into this
@@ -1309,7 +1488,8 @@ impl<'a, T: ExpGenerator<'a>> ExpRewriterFunctions for SpecTranslator<'a, '_, T>
                     self.builder.global_env().diag_with_labels(
                         Severity::Error,
                         &loc,
-                        "`old(..)` applied to expression which does not depend on state",
+                        "`old(..)` applied to expression which does not depend on state; \
+                         remove `old(..)` to use the state-independent value",
                         labels,
                     )
                 }
@@ -1404,18 +1584,12 @@ impl<'a, T: ExpGenerator<'a>> ExpRewriterFunctions for SpecTranslator<'a, '_, T>
                 )
                 .into_exp(),
             ),
-            // Memory mutation ops within a `WithStateAnchor` scope: an
-            // unlabeled pre-state range means "the pre-state of the
-            // enclosing scope". Outside of anchors that is function entry,
-            // which the backend realizes as Boogie-native `old(..)`; inside
-            // an anchor it is the anchored program point, so the range is
-            // relabeled to the anchor label (like `old(Global)` reads
-            // above). Without this, a mutation op derived from an anchored
-            // lambda would compare against function entry, wrongly failing
-            // when memory of the same resource changed before the anchor.
-            SpecPublish(range) | SpecRemove(range) | SpecUpdate(range)
-                if range.pre.is_none() && self.current_anchor.is_some() =>
-            {
+            // Snapshot the enclosing pre-state explicitly, just as for old
+            // reads. It is function entry for a definition, but call entry
+            // for a callee contract and the anchor point for an inline spec.
+            // Boogie-native old() would incorrectly use the caller's entry
+            // when the resource changed before an opaque call.
+            SpecPublish(range) | SpecRemove(range) | SpecUpdate(range) if range.pre.is_none() => {
                 let label = self.save_memory(self.builder.get_memory_of_node(id));
                 let new_range = MemoryRange {
                     pre: Some(label),
@@ -1499,8 +1673,9 @@ impl<'a, T: ExpGenerator<'a>> ExpRewriterFunctions for SpecTranslator<'a, '_, T>
                     None
                 }
             },
-            // Behavior with labels already set: leave as-is
-            Behavior(_, range) if !range.is_default() => None,
+            // An explicit post label does not supply the implicit entry state.
+            // Save that entry state for `..S` just as for an unlabeled call.
+            Behavior(_, range) if range.pre.is_some() => None,
             // Behavior that needs a pre-state label. When the whole
             // evaluator is under `old(..)`, both of its states are the old
             // state: leaving `post` unlabeled would let `result_of` and other
@@ -1516,6 +1691,9 @@ impl<'a, T: ExpGenerator<'a>> ExpRewriterFunctions for SpecTranslator<'a, '_, T>
                         mid.qualified(*fid),
                         &inst,
                     );
+                    if range.post.is_some() && used_memory.is_empty() {
+                        return None;
+                    }
                     let label = self.save_memory_concrete(used_memory);
                     let new_range = MemoryRange {
                         pre: Some(label),
@@ -1534,6 +1712,9 @@ impl<'a, T: ExpGenerator<'a>> ExpRewriterFunctions for SpecTranslator<'a, '_, T>
                     let struct_env = env.get_module(*smid).into_struct(*sid);
                     let field_sym = field_id.symbol();
                     let memory = collect_field_access_memory(env, &struct_env, field_sym);
+                    if range.post.is_some() && memory.is_empty() {
+                        return None;
+                    }
                     let label = self.save_memory_shared(&memory, self.type_args);
                     let new_range = MemoryRange {
                         pre: Some(label),
@@ -1549,6 +1730,9 @@ impl<'a, T: ExpGenerator<'a>> ExpRewriterFunctions for SpecTranslator<'a, '_, T>
                     // the function's spec_used_memory / spec_old_memory, so
                     // this fallback covers the fun-param case too.
                     let used_memory = self.fun_env.get_spec_used_memory().clone();
+                    if range.post.is_some() && used_memory.is_empty() {
+                        return None;
+                    }
                     let label = self.save_memory_shared(&used_memory, self.type_args);
                     let new_range = MemoryRange {
                         pre: Some(label),
